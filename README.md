@@ -7,20 +7,32 @@ headers every time a distributor sends you a file.
 
 ## What it does
 
-1. Upload a `.csv`, `.xlsx`, or `.xls` file.
-2. It picks the most likely sheet and header row automatically (both are
-   adjustable, for files with title rows above the real header).
-3. Each column in the file is matched against your standard schema:
-   - 🟢 already known (from a saved mapping, or an exact name match) — pre-filled
-   - 🟡 new — pick where it goes, once
-4. Click **Save mapping & generate file** — your choices are written to
-   `mappings.json` and applied automatically to every future file with that
-   same header.
-5. Download the result as `.csv` or `.xlsx`, already reshaped into your
-   standard column order.
+Built for the common case where one POS/commission workbook spreads your
+data across several sheets (e.g. a "Detail" sheet for direct sales, a "POS"
+sheet for distributor sales, and a "Summary" sheet you don't want) — and
+where you get a new file like this every month/week.
 
-The sidebar lets you review or forget individual remembered mappings, and edit
-your standard column list (`standard_headers.json`) if your schema changes.
+1. Upload one or many `.csv`/`.xlsx`/`.xls` files at once.
+2. **New sheet types** (by sheet name) get a one-time setup: include or skip
+   it, its header row, and an **anchor column** — a column that's always
+   filled on a real data row. This is what lets the tool automatically throw
+   out subtotal rows, blank separator rows, and stray pivot tables that
+   often sit below the real data in the same sheet, without you deleting
+   them by hand. The tool guesses a sensible anchor (preferring a date
+   column) and you can override it.
+3. **New columns** in included sheets get mapped to your standard schema,
+   same as before — 🟢 pre-filled from memory or an exact name match, 🟡 new,
+   pick once.
+4. Click **Save mapping & generate merged file** — every sheet decision and
+   column mapping is written to disk (`sheet_profiles.json`, `mappings.json`)
+   and reused automatically for every future upload with the same sheet
+   names/headers. All included sheets from all uploaded files are combined
+   into **one** output table.
+5. Download the result as `.csv` or `.xlsx`.
+
+The sidebar lets you review/forget individual remembered sheet setups and
+column mappings, and edit your standard column list
+(`standard_headers.json`) if your schema changes.
 
 ## Run locally
 
@@ -67,6 +79,7 @@ pos-header-mapper/
 ├── app.py                  # the Streamlit app
 ├── standard_headers.json   # your target schema (edit via the sidebar or directly)
 ├── mappings.json           # remembered header → standard-column mappings
+├── sheet_profiles.json     # remembered per-sheet-name setup (include/skip, header row, anchor column)
 ├── requirements.txt
 ├── .streamlit/config.toml  # theme
 └── .gitignore
