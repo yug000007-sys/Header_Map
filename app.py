@@ -389,25 +389,32 @@ if uploaded_files:
             for fname, sheet_name, headers, rows_df in extracted:
                 st.write(f"- **{fname}** / *{sheet_name}*: {len(rows_df)} rows")
 
-        # gather all distinct source headers across included sheets
-        all_headers = []
-        seen = set()
-        for _, _, headers, _ in extracted:
-            for h in headers:
-                n = normalize(h)
-                if n not in seen:
-                    seen.add(n)
-                    all_headers.append(h)
+        # group by sheet name (same-named sheets across files share one mapping section),
+        # preserving the order sheets were first seen
+        sheets_in_order = []
+        seen_sheet_names = set()
+        headers_by_sheet = {}
+        for fname, sheet_name, headers, rows_df in extracted:
+            norm_sheet = normalize(sheet_name)
+            if norm_sheet not in seen_sheet_names:
+                seen_sheet_names.add(norm_sheet)
+                sheets_in_order.append((norm_sheet, sheet_name))
+                headers_by_sheet[norm_sheet] = headers  # every header from the raw file, no dedup
 
         std_options = [IGNORE_LABEL] + st.session_state.std_headers
-        mapping_choices = {}
+        mapping_choices = {}  # (norm_sheet, src) -> chosen target
+        total_header_count = 0
         auto_count = 0
 
-        if all_headers:
+        for norm_sheet, sheet_name in sheets_in_order:
+            headers = headers_by_sheet[norm_sheet]
+            st.markdown(f"#### 📄 {sheet_name}")
+            st.caption(f"{len(headers)} column(s) found in this sheet")
             hc1, hc2, hc3 = st.columns([3, 1, 4])
-            hc1.markdown("**Column found in your sheets**")
+            hc1.markdown("**Column in this sheet**")
             hc3.markdown("**Maps to your standard column**")
-            for src in all_headers:
+            for src in headers:
+                total_header_count += 1
                 n = normalize(src)
                 saved = st.session_state.mappings.get(n)
                 if saved is not None:
@@ -424,12 +431,16 @@ if uploaded_files:
                 c1.markdown(f"{dot} `{src}`")
                 c2.markdown("→")
                 choice = c3.selectbox(
-                    f"map_{src}", std_options, index=idx, key=f"map_{src}", label_visibility="collapsed"
+                    f"map_{norm_sheet}_{src}", std_options, index=idx,
+                    key=f"map_{norm_sheet}_{src}", label_visibility="collapsed",
                 )
-                mapping_choices[src] = choice
+                mapping_choices[(norm_sheet, src)] = choice
+            st.divider()
+
+        if total_header_count:
             st.caption(
                 f"🟢 auto-filled from memory or exact name match · 🟡 needs your input "
-                f"({auto_count}/{len(all_headers)} pre-filled)"
+                f"({auto_count}/{total_header_count} pre-filled)"
             )
 
         col_a, col_b = st.columns([1, 1])
@@ -442,16 +453,17 @@ if uploaded_files:
                 st.rerun()
 
         if generate_clicked:
-            for src, choice in mapping_choices.items():
+            for (norm_sheet, src), choice in mapping_choices.items():
                 n = normalize(src)
                 st.session_state.mappings[n] = "" if choice == IGNORE_LABEL else choice
             save_json(MAPPINGS_FILE, st.session_state.mappings)
 
             combined_frames = []
             for fname, sheet_name, headers, rows_df in extracted:
+                norm_sheet = normalize(sheet_name)
                 out_df = pd.DataFrame(index=range(len(rows_df)), columns=st.session_state.std_headers)
                 for src in headers:
-                    choice = mapping_choices.get(src, IGNORE_LABEL)
+                    choice = mapping_choices.get((norm_sheet, src), IGNORE_LABEL)
                     if choice != IGNORE_LABEL and src in rows_df.columns:
                         out_df[choice] = rows_df[src].values
                 out_df["_source_file"] = fname
