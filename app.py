@@ -200,7 +200,7 @@ def clean_money_value(value):
     if is_blank(value):
         return ""
     try:
-        return round(float(value), 2)
+        return round(float(str(value).replace(",", "")), 2)
     except (ValueError, TypeError):
         return value
 
@@ -221,17 +221,146 @@ def format_output_df(df, std_headers):
 
 
 def read_sheets(uploaded_file):
-    """Returns dict: sheet_name -> raw_df (header=None). For CSVs, a single
-    pseudo-sheet named after the file."""
+    """Returns dict: sheet_name -> {"kind": "excel"/"pdf", ...}.
+    Excel/CSV entries carry a raw 2D grid (raw_df). PDF entries carry
+    already-parsed headers + rows_df (see extract_pdf_sheet)."""
     name = uploaded_file.name
+    if name.lower().endswith(".pdf"):
+        sheet_name, headers, rows_df = extract_pdf_sheet(uploaded_file)
+        return {sheet_name: {"kind": "pdf", "headers": headers, "rows_df": rows_df}}
     if name.lower().endswith(".csv"):
         df = pd.read_csv(uploaded_file, header=None, dtype=str)
-        return {re.sub(r"\.[^.]+$", "", name): df}
+        return {re.sub(r"\.[^.]+$", "", name): {"kind": "excel", "raw_df": df}}
     xls = pd.ExcelFile(uploaded_file)
     out = {}
     for sheet in xls.sheet_names:
-        out[sheet] = xls.parse(sheet, header=None, dtype=str)
+        out[sheet] = {"kind": "excel", "raw_df": xls.parse(sheet, header=None, dtype=str)}
     return out
+
+
+# --------------------------------------------------------------------------
+# PDF ingestion (pattern-based, for commission-statement style tables:
+# Salesperson | Customer ID | Ship-to + Customer Name | Order | Invoice |
+# Invoice Date | Due Date | ... money columns ... )
+# --------------------------------------------------------------------------
+PDF_CUSTOMER_ID_RE = re.compile(r"^[A-Z]\d{5,8}$")
+PDF_ORDER_TOKEN_RE = re.compile(r"^(SO|R)\d+$")
+PDF_DATE_TOKEN_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}")
+PDF_MONEY_TOKEN_RE = re.compile(r"-?[\d,]+\.\d{2}")
+PDF_HEADERS = ["Customer", "CustomerName", "Order", "Invoice", "InvoiceDate", "CommissionBase", "PaymentDue"]
+
+
+def cluster_words_into_rows(words, y_tol=2.5):
+    rows = []
+    current = []
+    last_top = None
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        if last_top is None or abs(w["top"] - last_top) <= y_tol:
+            current.append(w)
+        else:
+            rows.append(current)
+            current = [w]
+        last_top = w["top"]
+    if current:
+        rows.append(current)
+    return rows
+
+
+def pdf_row_is_highlighted(row_words, rects):
+    """A row counts as highlighted if a non-white, non-dark-header-style
+    filled rectangle overlaps most of its vertical span (pastel highlight
+    colors used to flag adjustment/tariff rows in these statements)."""
+    tops = [w["top"] for w in row_words]
+    bots = [w["bottom"] for w in row_words]
+    r_top, r_bot = min(tops), max(bots)
+    for rect in rects:
+        color = rect.get("non_stroking_color")
+        if not rect.get("fill") or not color:
+            continue
+        if isinstance(color, (int, float)):
+            r, g, b = color, color, color
+        elif len(color) == 1:
+            r = g = b = color[0]
+        else:
+            r, g, b = color[0], color[1], color[2]
+        brightness = (r + g + b) / 3
+        if brightness > 0.98 or brightness < 0.5:
+            continue  # skip pure white and dark header bars
+        overlap = min(r_bot, rect["bottom"]) - max(r_top, rect["top"])
+        if overlap > 0.5 * (r_bot - r_top):
+            return True
+    return False
+
+
+def parse_pdf_data_row(row_words):
+    tokens = [w["text"] for w in sorted(row_words, key=lambda w: w["x0"])]
+    text = " ".join(tokens)
+    cust = next((t for t in tokens if PDF_CUSTOMER_ID_RE.match(t)), None)
+    order = next((t for t in tokens if PDF_ORDER_TOKEN_RE.match(t)), None)
+    if not cust or not order:
+        return None
+    ci, oi = tokens.index(cust), tokens.index(order)
+    name_blob = " ".join(tokens[ci + 1: oi])
+    m = re.match(r"^(\d+)?\s*(.*)$", name_blob)
+    cust_name = m.group(2).strip() if m else name_blob
+
+    invoice_num = next((t for t in tokens[oi + 1:] if t.isdigit()), None)
+    inv_date = None
+    if invoice_num:
+        idx2 = tokens.index(invoice_num)
+        for t in tokens[idx2 + 1:]:
+            dm = PDF_DATE_TOKEN_RE.match(t)
+            if dm:
+                inv_date = dm.group(0)
+                break
+
+    money_tokens = PDF_MONEY_TOKEN_RE.findall(text)
+    commission_base = money_tokens[1] if len(money_tokens) >= 7 else (money_tokens[0] if money_tokens else None)
+    payment_due = money_tokens[-1] if money_tokens else None
+
+    return {
+        "Customer": cust, "CustomerName": cust_name, "Order": order,
+        "Invoice": invoice_num, "InvoiceDate": inv_date,
+        "CommissionBase": commission_base, "PaymentDue": payment_due,
+    }
+
+
+def extract_pdf_sheet(uploaded_file):
+    """Parse every page of a commission-statement PDF into a clean rows_df
+    (columns = PDF_HEADERS + '_highlighted'). The pseudo 'sheet name' is
+    derived from the document's title line so the same vendor's PDF is
+    recognized automatically every month."""
+    import pdfplumber
+
+    records = []
+    title = None
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            if not words:
+                continue
+            if title is None:
+                lines = [l for l in (page.extract_text() or "").split("\n") if l.strip()]
+                title = lines[0] if lines else uploaded_file.name
+            rects = page.rects
+            for row_words in cluster_words_into_rows(words):
+                parsed = parse_pdf_data_row(row_words)
+                if parsed:
+                    parsed["_highlighted"] = pdf_row_is_highlighted(row_words, rects)
+                    records.append(parsed)
+
+    sheet_name = title or uploaded_file.name
+    rows_df = pd.DataFrame(records, columns=PDF_HEADERS + ["_highlighted"])
+    return sheet_name, PDF_HEADERS, rows_df
+
+
+def is_zero_or_blank(value):
+    if is_blank(value):
+        return True
+    try:
+        return float(str(value).replace(",", "")) == 0
+    except (ValueError, TypeError):
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -263,11 +392,16 @@ with st.sidebar:
     for norm_name, prof in sorted(st.session_state.sheet_profiles.items()):
         c1, c2 = st.columns([5, 1])
         status = "included" if prof.get("include") else "skipped"
-        c1.markdown(
-            f"`{norm_name}` — **{status}**"
-            + (f", header row {prof.get('header_row')}, anchor `{prof.get('anchor_column')}` ({prof.get('anchor_type')})"
-               if prof.get("include") else "")
-        )
+        detail = ""
+        if prof.get("include"):
+            if prof.get("kind") == "pdf":
+                detail = (
+                    f", PDF · drop highlighted: {prof.get('drop_highlighted', True)}"
+                    + (f" · skip if `{prof.get('zero_skip_column')}` is 0" if prof.get("zero_skip_column") else "")
+                )
+            else:
+                detail = f", header row {prof.get('header_row')}, anchor `{prof.get('anchor_column')}` ({prof.get('anchor_type')})"
+        c1.markdown(f"`{norm_name}` — **{status}**{detail}")
         if c2.button("✕", key=f"delprof_{norm_name}", help="Forget this sheet setup"):
             del st.session_state.sheet_profiles[norm_name]
             save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
@@ -321,7 +455,7 @@ st.caption(
 )
 
 uploaded_files = st.file_uploader(
-    "Upload POS file(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True
+    "Upload POS file(s)", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True
 )
 
 if uploaded_files:
@@ -347,17 +481,33 @@ if uploaded_files:
         widget_state = {}
         for sheet_name in unresolved:
             norm_name = normalize(sheet_name)
-            # find one representative raw_df for this sheet name (from first file that has it)
-            sample_df = next(
+            # find one representative entry for this sheet name (from first file that has it)
+            entry = next(
                 sheets[sheet_name] for sheets in file_sheets.values() if sheet_name in sheets
             )
-            with st.expander(f"Sheet: {sheet_name}", expanded=True):
+            kind = entry.get("kind", "excel")
+            with st.expander(f"Sheet: {sheet_name} ({'PDF' if kind == 'pdf' else 'spreadsheet'})", expanded=True):
                 include = st.checkbox(
                     "Include this sheet's rows in the merge",
                     value=not any(k in normalize(sheet_name) for k in ["summary", "pivot", "index", "readme"]),
                     key=f"inc_{norm_name}",
                 )
-                if include:
+                if include and kind == "pdf":
+                    headers = entry["headers"]
+                    st.checkbox(
+                        "Drop highlighted/colored rows (e.g. tariff or adjustment lines)",
+                        value=True, key=f"drophl_{norm_name}",
+                    )
+                    zero_options = ["— none —"] + headers
+                    default_zero = "PaymentDue" if "PaymentDue" in headers else zero_options[0]
+                    st.selectbox(
+                        "Skip rows where this column is zero or blank (optional)",
+                        zero_options, index=zero_options.index(default_zero),
+                        key=f"zeroskip_{norm_name}",
+                    )
+                    st.caption(f"Columns extracted from this PDF: {', '.join(headers)}")
+                elif include:
+                    sample_df = entry["raw_df"]
                     default_hr = detect_header_row(sample_df)
                     header_row = st.number_input(
                         "Header row (1-indexed)", min_value=1,
@@ -380,22 +530,32 @@ if uploaded_files:
                         st.caption(f"Detected columns: {', '.join(headers)}")
                     else:
                         st.warning("No columns detected on that header row.")
-                widget_state[norm_name] = sheet_name
+                widget_state[norm_name] = (sheet_name, kind)
 
         if st.button("Save sheet setup", type="primary"):
-            for norm_name, sheet_name in widget_state.items():
+            for norm_name, (sheet_name, kind) in widget_state.items():
                 include = st.session_state.get(f"inc_{norm_name}", False)
-                if include:
+                if not include:
+                    st.session_state.sheet_profiles[norm_name] = {
+                        "display_name": sheet_name, "include": False, "kind": kind,
+                    }
+                elif kind == "pdf":
+                    zero_choice = st.session_state.get(f"zeroskip_{norm_name}", "— none —")
                     st.session_state.sheet_profiles[norm_name] = {
                         "display_name": sheet_name,
                         "include": True,
-                        "header_row": st.session_state.get(f"hr_{norm_name}", 1),
-                        "anchor_column": st.session_state.get(f"anchor_{norm_name}"),
-                        "anchor_type": st.session_state.get(f"anchortype_{norm_name}", "text"),
+                        "kind": "pdf",
+                        "drop_highlighted": st.session_state.get(f"drophl_{norm_name}", True),
+                        "zero_skip_column": "" if zero_choice == "— none —" else zero_choice,
                     }
                 else:
                     st.session_state.sheet_profiles[norm_name] = {
-                        "display_name": sheet_name, "include": False,
+                        "display_name": sheet_name,
+                        "include": True,
+                        "kind": "excel",
+                        "header_row": st.session_state.get(f"hr_{norm_name}", 1),
+                        "anchor_column": st.session_state.get(f"anchor_{norm_name}"),
+                        "anchor_type": st.session_state.get(f"anchortype_{norm_name}", "text"),
                     }
             save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
             st.rerun()
@@ -404,20 +564,34 @@ if uploaded_files:
         # 3) All sheets resolved — extract rows from every included sheet of every file
         extracted = []  # list of (filename, sheet_name, headers, df_rows)
         for fname, sheets in file_sheets.items():
-            for sheet_name, raw_df in sheets.items():
+            for sheet_name, entry in sheets.items():
                 prof = st.session_state.sheet_profiles.get(normalize(sheet_name))
                 if not prof or not prof.get("include"):
                     continue
-                header_row = prof["header_row"]
-                headers, keep_idx = get_headers_and_col_indices(raw_df, header_row)
-                if not headers:
-                    continue
-                anchor_col = prof.get("anchor_column") or headers[0]
-                anchor_type = prof.get("anchor_type", "text")
-                if anchor_col not in headers:
-                    anchor_col = headers[0]
-                rows_df = extract_valid_rows(raw_df, header_row, headers, keep_idx, anchor_col, anchor_type)
-                extracted.append((fname, sheet_name, headers, rows_df))
+                kind = prof.get("kind", entry.get("kind", "excel"))
+
+                if kind == "pdf":
+                    headers = entry["headers"]
+                    rows_df = entry["rows_df"].copy()
+                    if prof.get("drop_highlighted", True) and "_highlighted" in rows_df.columns:
+                        rows_df = rows_df[~rows_df["_highlighted"].astype(bool)]
+                    zero_col = prof.get("zero_skip_column")
+                    if zero_col and zero_col in rows_df.columns:
+                        rows_df = rows_df[~rows_df[zero_col].apply(is_zero_or_blank)]
+                    rows_df = rows_df.drop(columns=["_highlighted"], errors="ignore").reset_index(drop=True)
+                    extracted.append((fname, sheet_name, headers, rows_df))
+                else:
+                    raw_df = entry["raw_df"]
+                    header_row = prof["header_row"]
+                    headers, keep_idx = get_headers_and_col_indices(raw_df, header_row)
+                    if not headers:
+                        continue
+                    anchor_col = prof.get("anchor_column") or headers[0]
+                    anchor_type = prof.get("anchor_type", "text")
+                    if anchor_col not in headers:
+                        anchor_col = headers[0]
+                    rows_df = extract_valid_rows(raw_df, header_row, headers, keep_idx, anchor_col, anchor_type)
+                    extracted.append((fname, sheet_name, headers, rows_df))
 
         total_rows = sum(len(r[3]) for r in extracted)
         st.subheader("Step 2 — Review column mapping")
