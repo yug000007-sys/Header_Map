@@ -191,7 +191,7 @@ def clean_date_value(value):
     if is_blank(value):
         return ""
     try:
-        return pd.to_datetime(value).strftime("%Y-%m-%d")
+        return pd.to_datetime(value).strftime("%m/%d/%Y")
     except (ValueError, TypeError):
         return value
 
