@@ -478,6 +478,48 @@ with st.sidebar:
         else:
             st.error("Enter at least one column name.")
 
+    st.divider()
+    st.header("💾 Backup / restore data")
+    st.caption(
+        "Your mappings, sheet setups, and standard columns — bundled into one "
+        "file. Keep this safe; if the app's data ever gets reset (e.g. an "
+        "app.py update accidentally overwrote the JSON files), restore from "
+        "here instead of starting over."
+    )
+    backup_payload = json.dumps({
+        "mappings": st.session_state.mappings,
+        "sheet_profiles": st.session_state.sheet_profiles,
+        "standard_headers": st.session_state.std_headers,
+    }, indent=2, ensure_ascii=False)
+    st.download_button(
+        "⬇ Download backup",
+        backup_payload.encode("utf-8"),
+        file_name=f"pos_header_mapper_backup_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.json",
+        mime="application/json",
+    )
+
+    restore_file = st.file_uploader("Restore from a backup file", type=["json"], key="restore_uploader")
+    if restore_file is not None:
+        try:
+            backup_data = json.load(restore_file)
+            st.warning(
+                f"This backup has {len(backup_data.get('mappings', {}))} mapping(s), "
+                f"{len(backup_data.get('sheet_profiles', {}))} sheet setup(s), and "
+                f"{len(backup_data.get('standard_headers', []))} standard column(s). "
+                "Restoring will overwrite your current data."
+            )
+            if st.button("Confirm restore"):
+                st.session_state.mappings = backup_data.get("mappings", {})
+                st.session_state.sheet_profiles = backup_data.get("sheet_profiles", {})
+                st.session_state.std_headers = backup_data.get("standard_headers", DEFAULT_STD_HEADERS)
+                save_json(MAPPINGS_FILE, st.session_state.mappings)
+                save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
+                save_json(STD_HEADERS_FILE, st.session_state.std_headers)
+                st.success("Restored.")
+                st.rerun()
+        except (json.JSONDecodeError, AttributeError):
+            st.error("That doesn't look like a valid backup file.")
+
 
 # --------------------------------------------------------------------------
 # main
