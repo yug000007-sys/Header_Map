@@ -62,8 +62,17 @@ def load_json(path, default):
 
 
 def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except OSError as e:
+        st.error(
+            f"⚠️ Could not save to `{os.path.basename(path)}` — your mapping/setup won't be "
+            f"remembered next time. This usually means the app's folder is read-only in this "
+            f"deployment (common on some hosting setups). Error: {e}"
+        )
+        return False
 
 
 def normalize(s):
@@ -387,6 +396,27 @@ if "output_df" not in st.session_state:
 # sidebar
 # --------------------------------------------------------------------------
 with st.sidebar:
+    with st.expander("💾 Storage status", expanded=False):
+        st.caption(f"App folder: `{APP_DIR}`")
+        writable = os.access(APP_DIR, os.W_OK)
+        if writable:
+            st.markdown("✅ Folder is writable — mappings should persist across runs.")
+        else:
+            st.markdown(
+                "🔴 Folder is **not writable** in this environment. Mappings will "
+                "reset every time the app restarts. This happens on some hosting "
+                "setups with a read-only filesystem — run locally, or point "
+                "`MAPPINGS_FILE`/`SHEET_PROFILES_FILE` at a writable/persistent "
+                "location for your deployment."
+            )
+        st.caption(f"`mappings.json`: {len(st.session_state.mappings)} entries")
+        st.caption(f"`sheet_profiles.json`: {len(st.session_state.sheet_profiles)} entries")
+        st.caption(
+            "If this count resets to 0 after you restart the app even though you "
+            "clicked **Save mapping**, the app's storage isn't persisting in your "
+            "environment — see above."
+        )
+
     st.header("Remembered sheet setups")
     st.caption(f"{len(st.session_state.sheet_profiles)} sheet type(s) remembered")
     for norm_name, prof in sorted(st.session_state.sheet_profiles.items()):
@@ -454,9 +484,22 @@ st.caption(
     "future file with the same shape is merged automatically into one output."
 )
 
-uploaded_files = st.file_uploader(
-    "Upload POS file(s)", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True
-)
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+uc1, uc2 = st.columns([5, 1])
+with uc1:
+    uploaded_files = st.file_uploader(
+        "Upload POS file(s)", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_key}",
+    )
+with uc2:
+    st.write("")  # vertical spacer to align button with the uploader
+    st.write("")
+    if st.button("🗑 Clear files"):
+        st.session_state.uploader_key += 1
+        st.session_state.output_df = None
+        st.rerun()
 
 if uploaded_files:
     # 1) Read every sheet of every file
@@ -670,7 +713,7 @@ if uploaded_files:
             for (norm_sheet, src), choice in mapping_choices.items():
                 n = normalize(src)
                 st.session_state.mappings[n] = "" if choice == IGNORE_LABEL else choice
-            save_json(MAPPINGS_FILE, st.session_state.mappings)
+            mappings_saved_ok = save_json(MAPPINGS_FILE, st.session_state.mappings)
 
             combined_frames = []
             for fname, sheet_name, headers, rows_df in extracted:
@@ -690,7 +733,13 @@ if uploaded_files:
             final_df = format_output_df(final_df, st.session_state.std_headers)
             final_df = final_df.fillna("")
             st.session_state.output_df = final_df
-            st.success(f"Merged. {len(final_df)} rows ready to download below.")
+            if mappings_saved_ok:
+                st.success(
+                    f"Merged. {len(final_df)} rows ready to download below. "
+                    f"{len(mapping_choices)} column mapping(s) saved for next time."
+                )
+            else:
+                st.warning(f"Merged. {len(final_df)} rows ready — but see the storage warning above.")
 
 
 if st.session_state.output_df is not None:
