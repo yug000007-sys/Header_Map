@@ -20,6 +20,7 @@ from datetime import datetime
 from io import BytesIO
 
 import pandas as pd
+import pdfplumber
 import streamlit as st
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -239,8 +240,11 @@ def read_sheets(uploaded_file):
     already-parsed headers + rows_df (see extract_pdf_sheet)."""
     name = uploaded_file.name
     if name.lower().endswith(".pdf"):
-        sheet_name, headers, rows_df = extract_pdf_sheet(uploaded_file)
-        return {sheet_name: {"kind": "pdf", "headers": headers, "rows_df": rows_df}}
+        sheet_name, headers, rows_df, supports_highlight = extract_pdf_sheet(uploaded_file)
+        return {sheet_name: {
+            "kind": "pdf", "headers": headers, "rows_df": rows_df,
+            "supports_highlight": supports_highlight,
+        }}
     if name.lower().endswith(".csv"):
         df = pd.read_csv(uploaded_file, header=None, dtype=str)
         return {re.sub(r"\.[^.]+$", "", name): {"kind": "excel", "raw_df": df}}
@@ -338,13 +342,13 @@ def parse_pdf_data_row(row_words):
     }
 
 
-def extract_pdf_sheet(uploaded_file):
-    """Parse every page of a commission-statement PDF into a clean rows_df
-    (columns = PDF_HEADERS + '_highlighted'). The pseudo 'sheet name' is
-    derived from the document's title line so the same vendor's PDF is
-    recognized automatically every month."""
-    import pdfplumber
-
+def extract_pdf_sheet_hhp(uploaded_file):
+    """Format A: commission-statement style tables — Salesperson | Customer ID |
+    Ship-to + Customer Name | Order | Invoice | Invoice Date | Due Date | ...
+    money columns. Parses every page into a clean rows_df (columns =
+    PDF_HEADERS + '_highlighted'). The pseudo 'sheet name' is derived from
+    the document's title line so the same vendor's PDF is recognized
+    automatically every month."""
     records = []
     title = None
     with pdfplumber.open(uploaded_file) as pdf:
@@ -364,7 +368,136 @@ def extract_pdf_sheet(uploaded_file):
 
     sheet_name = title or uploaded_file.name
     rows_df = pd.DataFrame(records, columns=PDF_HEADERS + ["_highlighted"])
-    return sheet_name, PDF_HEADERS, rows_df
+    return sheet_name, PDF_HEADERS, rows_df, True  # supports_highlight
+
+
+# --------------------------------------------------------------------------
+# PDF ingestion, format B: hierarchical "Agent Commission Recap" reports —
+# a customer header line (Customer# + Name/Address, no delimiter between
+# them), followed by one or more invoice lines (Invoice# / Date / Customer
+# PO# / Release# / Prod Line & Description / Sales Amt / Rate% / Earned),
+# each possibly followed by continuation lines that repeat only the
+# product-line + amount columns for the same invoice.
+# --------------------------------------------------------------------------
+AGENT_CUSTOMER_NUM_RE = re.compile(r"^\d{6,7}(-\d{1,4})?$")
+AGENT_INVOICE_NUM_RE = re.compile(r"^\d{7,9}$")
+AGENT_MONTHS = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
+AGENT_PRODCODE_RE = re.compile(r"^\d{2,4}[A-Z]{0,2}$")
+AGENT_BOILERPLATE_MARKERS = [
+    "Report:", "Company", "Division:", "Agent :", "Customer#", "Invoice#",
+    "COMMISSIONS REPORT", "Agent Recap", "Total of all",
+]
+AGENT_RECAP_HEADERS = [
+    "CustomerNumber", "CustomerName", "Invoice", "InvoiceDate", "CustomerPO",
+    "ProdLineCode", "ProdLineDescription", "SalesAmt", "RatePct", "Earned",
+]
+
+
+def split_name_from_address_blob(blob):
+    """Customer name and address are glued together with no delimiter in
+    these reports (e.g. 'GRAYBAR ELECTRIC CO. INC. #1072810 NORTH FIRST
+    AVE...'). The address portion always starts at the first digit."""
+    m = re.search(r"\d", blob)
+    if not m:
+        return blob.strip(), ""
+    return blob[:m.start()].strip(), blob[m.start():].strip()
+
+
+def detect_pdf_format(uploaded_file):
+    with pdfplumber.open(uploaded_file) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+    if "MONTHLY COMMISSIONS REPORT" in text or ("Agent :" in text and "Supplier:" in text):
+        return "agent_recap"
+    if "Salesperson" in text and ("Commission Base" in text or "Ship To" in text):
+        return "hhp"
+    return "hhp"  # fall back to the simpler flat-table parser
+
+
+def extract_pdf_sheet_agent_recap(uploaded_file):
+    records = []
+    cur_cust_num = cur_cust_name = None
+    cur_inv_num = cur_inv_date = None
+    in_recap_section = False
+    company, agent = None, None
+
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+            for row_words in cluster_words_into_rows(words):
+                tokens = [w["text"] for w in sorted(row_words, key=lambda w: w["x0"])]
+                if not tokens:
+                    continue
+                line_text = " ".join(tokens)
+
+                if company is None and line_text.startswith("Company"):
+                    company = line_text.split(":", 1)[-1].strip()
+                if agent is None and "Agent :" in line_text:
+                    agent = line_text.split("Agent :", 1)[-1].split("Supplier:")[0].strip()
+
+                if "Agent Recap" in line_text:
+                    in_recap_section = True
+                if in_recap_section:
+                    continue
+                if tokens[0].startswith("**"):
+                    continue
+                if any(m in line_text for m in AGENT_BOILERPLATE_MARKERS):
+                    continue
+                if set(tokens[0]) == {"-"}:
+                    continue
+
+                if AGENT_CUSTOMER_NUM_RE.match(tokens[0]) and not AGENT_INVOICE_NUM_RE.match(tokens[0]):
+                    cur_cust_num = tokens[0]
+                    cur_cust_name, _addr = split_name_from_address_blob(" ".join(tokens[1:]))
+                    continue
+
+                if (AGENT_INVOICE_NUM_RE.match(tokens[0]) and len(tokens) > 4
+                        and tokens[2] in AGENT_MONTHS and tokens[3].isdigit()):
+                    cur_inv_num, cur_inv_date = tokens[0], f"{tokens[1]} {tokens[2]} {tokens[3]}"
+                    rest = tokens[4:]
+                    if rest and rest[-1] == "USD":
+                        rest = rest[:-1]
+                    if len(rest) < 3:
+                        continue
+                    sales, rate, earned = rest[-3], rest[-2], rest[-1]
+                    middle = rest[:-3]
+                    code_idx = next((i for i, t in enumerate(middle) if AGENT_PRODCODE_RE.match(t)), None)
+                    if code_idx is None:
+                        continue
+                    records.append({
+                        "CustomerNumber": cur_cust_num, "CustomerName": cur_cust_name,
+                        "Invoice": cur_inv_num, "InvoiceDate": cur_inv_date,
+                        "CustomerPO": " ".join(middle[:code_idx]), "ProdLineCode": middle[code_idx],
+                        "ProdLineDescription": " ".join(middle[code_idx + 1:]),
+                        "SalesAmt": sales, "RatePct": rate, "Earned": earned,
+                    })
+                    continue
+
+                if AGENT_PRODCODE_RE.match(tokens[0]) and cur_inv_num:
+                    rest = tokens[1:]
+                    if rest and rest[-1] == "USD":
+                        rest = rest[:-1]
+                    if len(rest) < 3:
+                        continue
+                    sales, rate, earned = rest[-3], rest[-2], rest[-1]
+                    records.append({
+                        "CustomerNumber": cur_cust_num, "CustomerName": cur_cust_name,
+                        "Invoice": cur_inv_num, "InvoiceDate": cur_inv_date,
+                        "CustomerPO": "", "ProdLineCode": tokens[0],
+                        "ProdLineDescription": " ".join(rest[:-3]),
+                        "SalesAmt": sales, "RatePct": rate, "Earned": earned,
+                    })
+
+    sheet_name = " - ".join([p for p in [company, agent] if p]) or uploaded_file.name
+    rows_df = pd.DataFrame(records, columns=AGENT_RECAP_HEADERS + ["_highlighted"])
+    rows_df["_highlighted"] = False
+    return sheet_name, AGENT_RECAP_HEADERS, rows_df, False  # supports_highlight=False
+
+
+def extract_pdf_sheet(uploaded_file):
+    fmt = detect_pdf_format(uploaded_file)
+    if fmt == "agent_recap":
+        return extract_pdf_sheet_agent_recap(uploaded_file)
+    return extract_pdf_sheet_hhp(uploaded_file)
 
 
 def is_zero_or_blank(value):
@@ -584,12 +717,15 @@ if uploaded_files:
                 )
                 if include and kind == "pdf":
                     headers = entry["headers"]
-                    st.checkbox(
-                        "Drop highlighted/colored rows (e.g. tariff or adjustment lines)",
-                        value=True, key=f"drophl_{norm_name}",
-                    )
+                    supports_highlight = entry.get("supports_highlight", True)
+                    if supports_highlight:
+                        st.checkbox(
+                            "Drop highlighted/colored rows (e.g. tariff or adjustment lines)",
+                            value=True, key=f"drophl_{norm_name}",
+                        )
                     zero_options = ["— none —"] + headers
-                    default_zero = "PaymentDue" if "PaymentDue" in headers else zero_options[0]
+                    default_zero_candidates = [h for h in ("PaymentDue", "Earned") if h in headers]
+                    default_zero = default_zero_candidates[0] if default_zero_candidates else zero_options[0]
                     st.selectbox(
                         "Skip rows where this column is zero or blank (optional)",
                         zero_options, index=zero_options.index(default_zero),
