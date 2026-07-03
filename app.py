@@ -111,14 +111,18 @@ def get_headers_and_col_indices(raw_df, header_row):
     return headers, keep_idx
 
 
+DATE_PATTERN_RE = re.compile(
+    r"^\d{1,4}[/-]\d{1,2}[/-]\d{1,4}([ T]\d{1,2}:\d{2}(:\d{2})?)?$"
+)
+
+
 def looks_like_date(v):
     if is_blank(v):
         return False
     if isinstance(v, datetime):
         return True
     s = str(v).strip()
-    # cheap pre-filter so plain numbers/short text don't get misparsed as dates
-    if not re.search(r"\d", s) or len(s) < 6:
+    if not DATE_PATTERN_RE.match(s):
         return False
     try:
         pd.to_datetime(s)
@@ -417,44 +421,45 @@ with st.sidebar:
             "environment — see above."
         )
 
-    st.header("Remembered sheet setups")
-    st.caption(f"{len(st.session_state.sheet_profiles)} sheet type(s) remembered")
-    for norm_name, prof in sorted(st.session_state.sheet_profiles.items()):
-        c1, c2 = st.columns([5, 1])
-        status = "included" if prof.get("include") else "skipped"
-        detail = ""
-        if prof.get("include"):
-            if prof.get("kind") == "pdf":
-                detail = (
-                    f", PDF · drop highlighted: {prof.get('drop_highlighted', True)}"
-                    + (f" · skip if `{prof.get('zero_skip_column')}` is 0" if prof.get("zero_skip_column") else "")
-                )
-            else:
-                detail = f", header row {prof.get('header_row')}, anchor `{prof.get('anchor_column')}` ({prof.get('anchor_type')})"
-        c1.markdown(f"`{norm_name}` — **{status}**{detail}")
-        if c2.button("✕", key=f"delprof_{norm_name}", help="Forget this sheet setup"):
-            del st.session_state.sheet_profiles[norm_name]
-            save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
-            st.rerun()
-
-    st.divider()
-    st.header("Remembered column mappings")
-    st.caption(f"{len(st.session_state.mappings)} header(s) remembered")
-    if st.session_state.mappings:
-        for norm_src in sorted(st.session_state.mappings.keys()):
-            target = st.session_state.mappings[norm_src]
+    with st.expander(f"⚙️ Remembered sheet setups ({len(st.session_state.sheet_profiles)})", expanded=False):
+        for norm_name, prof in sorted(st.session_state.sheet_profiles.items()):
             c1, c2 = st.columns([5, 1])
-            c1.markdown(f"`{norm_src}` → **{target or '_(ignored)_'}**")
-            if c2.button("✕", key=f"delmap_{norm_src}", help="Forget this mapping"):
-                del st.session_state.mappings[norm_src]
-                save_json(MAPPINGS_FILE, st.session_state.mappings)
+            status = "included" if prof.get("include") else "skipped"
+            detail = ""
+            if prof.get("include"):
+                if prof.get("kind") == "pdf":
+                    detail = (
+                        f", PDF · drop highlighted: {prof.get('drop_highlighted', True)}"
+                        + (f" · skip if `{prof.get('zero_skip_column')}` is 0" if prof.get("zero_skip_column") else "")
+                    )
+                else:
+                    detail = f", header row {prof.get('header_row')}, anchor `{prof.get('anchor_column')}` ({prof.get('anchor_type')})"
+            c1.markdown(f"`{norm_name}` — **{status}**{detail}")
+            if c2.button("✕", key=f"delprof_{norm_name}", help="Forget this sheet setup"):
+                del st.session_state.sheet_profiles[norm_name]
+                save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
                 st.rerun()
-    if st.button("Clear all remembered mappings & sheet setups"):
-        st.session_state.mappings = {}
-        st.session_state.sheet_profiles = {}
-        save_json(MAPPINGS_FILE, {})
-        save_json(SHEET_PROFILES_FILE, {})
-        st.rerun()
+        if not st.session_state.sheet_profiles:
+            st.caption("Nothing remembered yet.")
+
+    with st.expander(f"⚙️ Remembered column mappings ({len(st.session_state.mappings)})", expanded=False):
+        if st.session_state.mappings:
+            for norm_src in sorted(st.session_state.mappings.keys()):
+                target = st.session_state.mappings[norm_src]
+                c1, c2 = st.columns([5, 1])
+                c1.markdown(f"`{norm_src}` → **{target or '_(ignored)_'}**")
+                if c2.button("✕", key=f"delmap_{norm_src}", help="Forget this mapping"):
+                    del st.session_state.mappings[norm_src]
+                    save_json(MAPPINGS_FILE, st.session_state.mappings)
+                    st.rerun()
+        else:
+            st.caption("Nothing remembered yet.")
+        if st.button("Clear all remembered mappings & sheet setups"):
+            st.session_state.mappings = {}
+            st.session_state.sheet_profiles = {}
+            save_json(MAPPINGS_FILE, {})
+            save_json(SHEET_PROFILES_FILE, {})
+            st.rerun()
 
     st.divider()
     st.header("Standard columns")
