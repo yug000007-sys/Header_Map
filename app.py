@@ -180,6 +180,46 @@ def extract_valid_rows(raw_df, header_row, headers, keep_idx, anchor_col, anchor
     return body[mask.values].reset_index(drop=True)
 
 
+DATE_COLUMN_KEYWORDS = ["date"]
+MONEY_COLUMN_KEYWORDS = [
+    "cost", "price", "amt", "amount", "commission", "sales", "bill",
+    "resale", "value", "split", "percentage", "rate",
+]
+
+
+def clean_date_value(value):
+    if is_blank(value):
+        return ""
+    try:
+        return pd.to_datetime(value).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return value
+
+
+def clean_money_value(value):
+    if is_blank(value):
+        return ""
+    try:
+        return round(float(value), 2)
+    except (ValueError, TypeError):
+        return value
+
+
+def format_output_df(df, std_headers):
+    """Strip the time-of-day from date-like columns and round money/rate-like
+    columns to 2 decimals, based on the standard column's name — fixes
+    '2026-04-30 00:00:00' -> '2026-04-30' and '7.8546260000000006' -> 7.85."""
+    for col in std_headers:
+        if col not in df.columns:
+            continue
+        name_lower = col.lower()
+        if any(k in name_lower for k in DATE_COLUMN_KEYWORDS):
+            df[col] = df[col].apply(clean_date_value)
+        elif any(k in name_lower for k in MONEY_COLUMN_KEYWORDS):
+            df[col] = df[col].apply(clean_money_value)
+    return df
+
+
 def read_sheets(uploaded_file):
     """Returns dict: sheet_name -> raw_df (header=None). For CSVs, a single
     pseudo-sheet named after the file."""
@@ -473,6 +513,7 @@ if uploaded_files:
             final_df = pd.concat(combined_frames, ignore_index=True) if combined_frames else pd.DataFrame(
                 columns=st.session_state.std_headers
             )
+            final_df = format_output_df(final_df, st.session_state.std_headers)
             final_df = final_df.fillna("")
             st.session_state.output_df = final_df
             st.success(f"Merged. {len(final_df)} rows ready to download below.")
