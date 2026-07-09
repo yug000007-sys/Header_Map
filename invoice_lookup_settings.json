@@ -1,0 +1,20 @@
+{
+  "recap_sheet_pattern": "recap",
+  "invoice_column_name": "Invoice Number",
+  "highlight_hex": "FFFF00",
+  "target_headers": [
+    "Company Name",
+    "Invoice Number",
+    "Invoice Date",
+    "Invoice Amount",
+    "%",
+    "Comm. Earned",
+    "SO#",
+    "P/N",
+    "Rev",
+    "Description",
+    "Qty",
+    "Price",
+    "PO#"
+  ]
+}

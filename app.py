@@ -19,6 +19,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 
+import extract_msg
 import openpyxl
 import pandas as pd
 import pdfplumber
@@ -568,6 +569,8 @@ DEFAULT_INVOICE_LOOKUP_SETTINGS = {
     "invoice_column_name": "Invoice Number",
     "highlight_hex": "FFFF00",
     "target_headers": DEFAULT_INVOICE_LOOKUP_HEADERS,
+    "amount_column_name": "Comm. Due",
+    "block_gap_rows": 3,
 }
 
 
@@ -594,10 +597,9 @@ def norm_invoice_key(v):
     return s
 
 
-def get_highlighted_values(ws, header_row, invoice_col_idx, highlight_hex):
-    """Return, in sheet order, the raw cell value of every row in the invoice
-    column whose fill color matches highlight_hex (case-insensitive, matches
-    on the trailing 6 hex digits so ARGB vs RGB doesn't matter)."""
+def get_highlighted_rows(ws, header_row, invoice_col_idx, amount_col_idx, highlight_hex):
+    """Return, in sheet order, every row in the invoice column whose fill
+    color matches highlight_hex, as {'row', 'invoice', 'amount'} dicts."""
     target = highlight_hex.strip().upper().lstrip("#")
     target = target[-6:] if len(target) >= 6 else target
     out = []
@@ -609,9 +611,71 @@ def get_highlighted_values(ws, header_row, invoice_col_idx, highlight_hex):
         if not fill or not fill.fgColor or not fill.fgColor.rgb:
             continue
         rgb = str(fill.fgColor.rgb)
-        if rgb[-6:] == target:
-            out.append(cell.value)
+        if rgb[-6:] != target:
+            continue
+        amount = row[amount_col_idx].value if amount_col_idx < len(row) else None
+        out.append({"row": cell.row, "invoice": cell.value, "amount": amount})
     return out
+
+
+def cluster_into_blocks(highlighted_rows, gap_rows=3):
+    """Group highlighted rows into contiguous blocks — separate batches of
+    highlighting that were left over from different months, distinguished
+    by a gap of more than gap_rows between them."""
+    if not highlighted_rows:
+        return []
+    blocks = [[highlighted_rows[0]]]
+    for prev, cur in zip(highlighted_rows, highlighted_rows[1:]):
+        if cur["row"] - prev["row"] <= gap_rows:
+            blocks[-1].append(cur)
+        else:
+            blocks.append([cur])
+    return blocks
+
+
+def summarize_blocks(blocks):
+    summaries = []
+    for b in blocks:
+        total = sum(float(r["amount"]) for r in b if isinstance(r["amount"], (int, float)))
+        summaries.append({
+            "row_start": b[0]["row"], "row_end": b[-1]["row"],
+            "count": len(b), "total": round(total, 2), "rows": b,
+        })
+    return summaries
+
+
+def find_matching_block(block_summaries, target_amount, tolerance=0.01):
+    for s in block_summaries:
+        if abs(s["total"] - target_amount) <= tolerance:
+            return s
+    return None
+
+
+def extract_amount_from_text(text):
+    """Pull a dollar amount like '$2,014.36' out of free-form email body text."""
+    matches = re.findall(r"\$\s*([\d,]+\.\d{2})", text or "")
+    if not matches:
+        return None
+    return float(matches[0].replace(",", ""))
+
+
+def parse_msg_upload(uploaded_file):
+    """Extract the first .xlsx attachment and the body text from an Outlook
+    .msg file. Returns (xlsx_bytesio, filename, body_text) or raises if no
+    Excel attachment is found."""
+    data = uploaded_file.read()
+    msg = extract_msg.Message(BytesIO(data))
+    body = msg.body or ""
+    xlsx_bytes, xlsx_name = None, None
+    for a in msg.attachments:
+        name = a.longFilename or a.shortFilename or ""
+        if name.lower().endswith((".xlsx", ".xls")):
+            xlsx_bytes, xlsx_name = a.data, name
+            break
+    msg.close()
+    if xlsx_bytes is None:
+        return None, None, body
+    return BytesIO(xlsx_bytes), xlsx_name, body
 
 
 def build_invoice_detail_lookup(wb, skip_sheet_name, target_headers, invoice_column_name):
@@ -644,21 +708,43 @@ def build_invoice_detail_lookup(wb, skip_sheet_name, target_headers, invoice_col
     return lookup
 
 
-def run_invoice_lookup(uploaded_file, recap_sheet_name, invoice_column_name, highlight_hex, target_headers):
+def run_invoice_lookup(
+    uploaded_file, recap_sheet_name, invoice_column_name, highlight_hex, target_headers,
+    amount_column_name=None, target_amount=None, block_gap_rows=3,
+):
     wb = openpyxl.load_workbook(uploaded_file, data_only=True)
     ws = wb[recap_sheet_name]
     header_row, header_vals = find_header_row_in_ws(ws, invoice_column_name)
     if header_row is None:
-        return None, [], f"Couldn't find a column named '{invoice_column_name}' in {recap_sheet_name}."
+        return None, [], None, f"Couldn't find a column named '{invoice_column_name}' in {recap_sheet_name}."
     col_idx = {h: i for i, h in enumerate(header_vals) if h}
     invoice_col_idx = col_idx[invoice_column_name]
+    amount_col_idx = col_idx.get(amount_column_name, invoice_col_idx) if amount_column_name else invoice_col_idx
 
-    highlighted_values = get_highlighted_values(ws, header_row, invoice_col_idx, highlight_hex)
+    highlighted_rows = get_highlighted_rows(ws, header_row, invoice_col_idx, amount_col_idx, highlight_hex)
+    block_summaries = summarize_blocks(cluster_into_blocks(highlighted_rows, block_gap_rows))
+
+    block_info = {"blocks": block_summaries, "matched_block": None}
+
+    if target_amount is not None:
+        matched = find_matching_block(block_summaries, target_amount)
+        block_info["matched_block"] = matched
+        if matched is None:
+            return None, [], block_info, (
+                f"None of the {len(block_summaries)} highlighted block(s) in {recap_sheet_name} sum to "
+                f"${target_amount:,.2f}. Block totals found: "
+                + ", ".join(f"${s['total']:,.2f} (rows {s['row_start']}-{s['row_end']})" for s in block_summaries)
+                + ". Nothing was extracted — check the amount or the highlighting."
+            )
+        invoices_to_find = [r["invoice"] for r in matched["rows"]]
+    else:
+        invoices_to_find = [r["invoice"] for r in highlighted_rows]
+
     lookup = build_invoice_detail_lookup(wb, recap_sheet_name, target_headers, invoice_column_name)
 
     matched_rows = []
     unmatched = []
-    for inv in highlighted_values:
+    for inv in invoices_to_find:
         key = norm_invoice_key(inv)
         if key in lookup:
             matched_rows.extend(lookup[key])
@@ -672,7 +758,7 @@ def run_invoice_lookup(uploaded_file, recap_sheet_name, invoice_column_name, hig
         for h in target_headers:
             if "date" in h.lower():
                 result_df[h] = result_df[h].apply(clean_date_value)
-    return result_df, unmatched, None
+    return result_df, unmatched, block_info, None
 
 
 # --------------------------------------------------------------------------
@@ -1158,11 +1244,10 @@ if st.session_state.tool_mode == "Header Mapper":
 elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
     st.title("🔎 Highlighted Invoice Lookup")
     st.caption(
-        "Upload a workbook with a summary/'recap' sheet where some invoice "
-        "numbers are highlighted, plus many other sheets containing the "
-        "detail line items for those invoices. This finds every highlighted "
-        "invoice and pulls its detail fields from wherever they live in the "
-        "workbook, into one output table."
+        "Upload the commission email (.msg) — or the workbook directly. Finds "
+        "the highlighted invoices in the recap sheet whose total matches the "
+        "commission amount, and pulls their detail fields from wherever they "
+        "live in the workbook, into one output table."
     )
 
     settings = st.session_state.invoice_lookup_settings
@@ -1175,9 +1260,17 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
             "Invoice number column name (must match exactly, case-sensitive)",
             value=settings.get("invoice_column_name", "Invoice Number"),
         )
+        amount_col = st.text_input(
+            "Comm. Due / amount column name (used to match against the email's dollar figure)",
+            value=settings.get("amount_column_name", "Comm. Due"),
+        )
         highlight_hex = st.text_input(
             "Highlight color (hex, e.g. FFFF00 for yellow)",
             value=settings.get("highlight_hex", "FFFF00"),
+        )
+        block_gap = st.number_input(
+            "Rows of gap that separate two different highlighted batches",
+            min_value=1, value=settings.get("block_gap_rows", 3),
         )
         headers_text = st.text_area(
             "Fields to pull from the detail sheets (one per line, must match "
@@ -1190,42 +1283,102 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
             st.session_state.invoice_lookup_settings = {
                 "recap_sheet_pattern": recap_pattern.strip() or "recap",
                 "invoice_column_name": invoice_col.strip() or "Invoice Number",
+                "amount_column_name": amount_col.strip() or "Comm. Due",
                 "highlight_hex": highlight_hex.strip() or "FFFF00",
+                "block_gap_rows": int(block_gap),
                 "target_headers": new_headers or DEFAULT_INVOICE_LOOKUP_HEADERS,
             }
             save_json(INVOICE_LOOKUP_SETTINGS_FILE, st.session_state.invoice_lookup_settings)
             st.success("Settings saved.")
             st.rerun()
 
-    lookup_file = st.file_uploader("Upload workbook", type=["xlsx", "xls"], key="lookup_uploader")
+    if "lookup_uploader_key" not in st.session_state:
+        st.session_state.lookup_uploader_key = 0
+
+    luc1, luc2 = st.columns([5, 1])
+    with luc1:
+        lookup_file = st.file_uploader(
+            "Upload the commission email (.msg) or the workbook directly",
+            type=["msg", "xlsx", "xls"],
+            key=f"lookup_uploader_{st.session_state.lookup_uploader_key}",
+        )
+    with luc2:
+        st.write("")
+        st.write("")
+        if st.button("🗑 Clear data"):
+            st.session_state.lookup_uploader_key += 1
+            st.session_state.invoice_lookup_result = None
+            st.rerun()
 
     if lookup_file is not None:
-        wb_preview = openpyxl.load_workbook(lookup_file, read_only=True)
+        workbook_file, email_body, auto_amount = lookup_file, None, None
+
+        if lookup_file.name.lower().endswith(".msg"):
+            xlsx_stream, xlsx_name, email_body = parse_msg_upload(lookup_file)
+            if xlsx_stream is None:
+                st.error("Couldn't find an Excel attachment inside this .msg file.")
+                st.stop()
+            workbook_file = xlsx_stream
+            auto_amount = extract_amount_from_text(email_body)
+            with st.expander("📧 Email body (for reference)", expanded=False):
+                st.text(email_body)
+            if auto_amount is None:
+                st.warning(
+                    "Couldn't automatically find a dollar amount in the email body — "
+                    "enter it manually below."
+                )
+
+        wb_preview = openpyxl.load_workbook(workbook_file, read_only=True)
         sheet_names = wb_preview.sheetnames
         wb_preview.close()
+        workbook_file.seek(0)
+
         recap_guess = guess_recap_sheet(sheet_names, settings.get("recap_sheet_pattern", "recap"))
         recap_sheet = st.selectbox(
             "Which sheet is the recap/summary sheet?",
             sheet_names, index=sheet_names.index(recap_guess),
         )
 
+        target_amount = st.number_input(
+            "Commission amount to match (leave 0 to include ALL highlighted rows, "
+            "no matching)",
+            min_value=0.0, value=float(auto_amount) if auto_amount else 0.0,
+            step=0.01, format="%.2f",
+        )
+
         if st.button("Run lookup", type="primary"):
+            workbook_file.seek(0)
             with st.spinner(f"Scanning {len(sheet_names)} sheets..."):
-                result_df, unmatched, error = run_invoice_lookup(
-                    lookup_file, recap_sheet,
+                result_df, unmatched, block_info, error = run_invoice_lookup(
+                    workbook_file, recap_sheet,
                     settings.get("invoice_column_name", "Invoice Number"),
                     settings.get("highlight_hex", "FFFF00"),
                     settings.get("target_headers", DEFAULT_INVOICE_LOOKUP_HEADERS),
+                    amount_column_name=settings.get("amount_column_name", "Comm. Due"),
+                    target_amount=target_amount if target_amount > 0 else None,
+                    block_gap_rows=settings.get("block_gap_rows", 3),
                 )
             if error:
                 st.error(error)
+                if block_info and block_info["blocks"]:
+                    with st.expander("Highlighted blocks found in this sheet"):
+                        for s in block_info["blocks"]:
+                            st.write(f"Rows {s['row_start']}–{s['row_end']} ({s['count']} rows): ${s['total']:,.2f}")
             else:
-                st.session_state.invoice_lookup_result = (result_df, unmatched)
+                st.session_state.invoice_lookup_result = (result_df, unmatched, block_info)
 
     if st.session_state.invoice_lookup_result is not None:
-        result_df, unmatched = st.session_state.invoice_lookup_result
+        result_df, unmatched, block_info = st.session_state.invoice_lookup_result
         st.divider()
         st.subheader("Result")
+        if block_info and block_info.get("matched_block"):
+            mb = block_info["matched_block"]
+            st.success(
+                f"Matched block: rows {mb['row_start']}–{mb['row_end']} "
+                f"({mb['count']} invoices, ${mb['total']:,.2f}) — "
+                f"{len(block_info['blocks'])} total highlighted block(s) found, "
+                f"others were ignored."
+            )
         st.caption(
             f"{len(result_df)} detail row(s) found"
             + (f" · {len(unmatched)} highlighted invoice(s) not found anywhere: {unmatched}" if unmatched else " · all highlighted invoices matched")
