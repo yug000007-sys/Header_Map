@@ -1138,7 +1138,7 @@ if st.session_state.tool_mode == "Header Mapper":
         st.divider()
         st.subheader("Download merged result")
         df = st.session_state.output_df
-        st.dataframe(df.head(30), use_container_width=True)
+        st.dataframe(df.head(30), use_container_width=True, height=500, hide_index=True)
 
         csv_bytes = df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇ Download CSV", csv_bytes, file_name="Merged_POS.csv", mime="text/csv")
@@ -1230,7 +1230,7 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
             f"{len(result_df)} detail row(s) found"
             + (f" · {len(unmatched)} highlighted invoice(s) not found anywhere: {unmatched}" if unmatched else " · all highlighted invoices matched")
         )
-        st.dataframe(result_df, use_container_width=True)
+        st.dataframe(result_df, use_container_width=True, height=500, hide_index=True)
 
         csv_bytes = result_df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇ Download CSV", csv_bytes, file_name="Highlighted_Invoice_Detail.csv", mime="text/csv")
