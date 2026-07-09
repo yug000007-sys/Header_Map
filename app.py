@@ -708,15 +708,18 @@ def build_invoice_detail_lookup(wb, skip_sheet_name, target_headers, invoice_col
     return lookup
 
 
-def run_invoice_lookup(
-    uploaded_file, recap_sheet_name, invoice_column_name, highlight_hex, target_headers,
-    amount_column_name=None, target_amount=None, block_gap_rows=3,
+def scan_highlighted_blocks(
+    workbook_bytes, recap_sheet_name, invoice_column_name, amount_column_name,
+    highlight_hex, block_gap_rows, target_amount=None,
 ):
-    wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+    """Find every highlighted block in the recap sheet and, if a target
+    amount is given, flag which block (if any) matches it. Doesn't touch
+    the detail sheets — just scans the recap sheet."""
+    wb = openpyxl.load_workbook(BytesIO(workbook_bytes), data_only=True)
     ws = wb[recap_sheet_name]
     header_row, header_vals = find_header_row_in_ws(ws, invoice_column_name)
     if header_row is None:
-        return None, [], None, f"Couldn't find a column named '{invoice_column_name}' in {recap_sheet_name}."
+        return None, f"Couldn't find a column named '{invoice_column_name}' in {recap_sheet_name}."
     col_idx = {h: i for i, h in enumerate(header_vals) if h}
     invoice_col_idx = col_idx[invoice_column_name]
     amount_col_idx = col_idx.get(amount_column_name, invoice_col_idx) if amount_column_name else invoice_col_idx
@@ -724,22 +727,18 @@ def run_invoice_lookup(
     highlighted_rows = get_highlighted_rows(ws, header_row, invoice_col_idx, amount_col_idx, highlight_hex)
     block_summaries = summarize_blocks(cluster_into_blocks(highlighted_rows, block_gap_rows))
 
-    block_info = {"blocks": block_summaries, "matched_block": None}
+    matched = find_matching_block(block_summaries, target_amount) if target_amount else None
+    for i, s in enumerate(block_summaries):
+        s["is_auto_match"] = (s is matched)
 
-    if target_amount is not None:
-        matched = find_matching_block(block_summaries, target_amount)
-        block_info["matched_block"] = matched
-        if matched is None:
-            return None, [], block_info, (
-                f"None of the {len(block_summaries)} highlighted block(s) in {recap_sheet_name} sum to "
-                f"${target_amount:,.2f}. Block totals found: "
-                + ", ".join(f"${s['total']:,.2f} (rows {s['row_start']}-{s['row_end']})" for s in block_summaries)
-                + ". Nothing was extracted — check the amount or the highlighting."
-            )
-        invoices_to_find = [r["invoice"] for r in matched["rows"]]
-    else:
-        invoices_to_find = [r["invoice"] for r in highlighted_rows]
+    return {"blocks": block_summaries, "matched_block": matched}, None
 
+
+def fetch_block_details(workbook_bytes, recap_sheet_name, invoice_column_name, target_headers, block):
+    """Given one chosen block (from scan_highlighted_blocks), pull its
+    invoices' detail rows from every other sheet in the workbook."""
+    wb = openpyxl.load_workbook(BytesIO(workbook_bytes), data_only=True)
+    invoices_to_find = [r["invoice"] for r in block["rows"]]
     lookup = build_invoice_detail_lookup(wb, recap_sheet_name, target_headers, invoice_column_name)
 
     matched_rows = []
@@ -758,7 +757,7 @@ def run_invoice_lookup(
         for h in target_headers:
             if "date" in h.lower():
                 result_df[h] = result_df[h].apply(clean_date_value)
-    return result_df, unmatched, block_info, None
+    return result_df, unmatched
 
 
 # --------------------------------------------------------------------------
@@ -1244,10 +1243,11 @@ if st.session_state.tool_mode == "Header Mapper":
 elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
     st.title("🔎 Highlighted Invoice Lookup")
     st.caption(
-        "Upload the commission email (.msg) — or the workbook directly. Finds "
-        "the highlighted invoices in the recap sheet whose total matches the "
-        "commission amount, and pulls their detail fields from wherever they "
-        "live in the workbook, into one output table."
+        "Upload the commission email (.msg) — or the workbook directly. Scans "
+        "the recap sheet for highlighted batches, recommends the one matching "
+        "the commission amount, and lets you pick any block if it guessed "
+        "wrong — then pulls that block's detail fields from wherever they "
+        "live in the workbook."
     )
 
     settings = st.session_state.invoice_lookup_settings
@@ -1294,6 +1294,10 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
 
     if "lookup_uploader_key" not in st.session_state:
         st.session_state.lookup_uploader_key = 0
+    if "invoice_lookup_workbook_bytes" not in st.session_state:
+        st.session_state.invoice_lookup_workbook_bytes = None
+    if "invoice_lookup_blocks" not in st.session_state:
+        st.session_state.invoice_lookup_blocks = None
 
     luc1, luc2 = st.columns([5, 1])
     with luc1:
@@ -1308,17 +1312,19 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
         if st.button("🗑 Clear data"):
             st.session_state.lookup_uploader_key += 1
             st.session_state.invoice_lookup_result = None
+            st.session_state.invoice_lookup_workbook_bytes = None
+            st.session_state.invoice_lookup_blocks = None
             st.rerun()
 
     if lookup_file is not None:
-        workbook_file, email_body, auto_amount = lookup_file, None, None
+        email_body, auto_amount = None, None
 
         if lookup_file.name.lower().endswith(".msg"):
             xlsx_stream, xlsx_name, email_body = parse_msg_upload(lookup_file)
             if xlsx_stream is None:
                 st.error("Couldn't find an Excel attachment inside this .msg file.")
                 st.stop()
-            workbook_file = xlsx_stream
+            workbook_bytes = xlsx_stream.read()
             auto_amount = extract_amount_from_text(email_body)
             with st.expander("📧 Email body (for reference)", expanded=False):
                 st.text(email_body)
@@ -1327,11 +1333,14 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
                     "Couldn't automatically find a dollar amount in the email body — "
                     "enter it manually below."
                 )
+        else:
+            workbook_bytes = lookup_file.read()
 
-        wb_preview = openpyxl.load_workbook(workbook_file, read_only=True)
+        st.session_state.invoice_lookup_workbook_bytes = workbook_bytes
+
+        wb_preview = openpyxl.load_workbook(BytesIO(workbook_bytes), read_only=True)
         sheet_names = wb_preview.sheetnames
         wb_preview.close()
-        workbook_file.seek(0)
 
         recap_guess = guess_recap_sheet(sheet_names, settings.get("recap_sheet_pattern", "recap"))
         recap_sheet = st.selectbox(
@@ -1340,45 +1349,69 @@ elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
         )
 
         target_amount = st.number_input(
-            "Commission amount to match (leave 0 to include ALL highlighted rows, "
-            "no matching)",
+            "Commission amount to match (used only to pre-select the recommended block below)",
             min_value=0.0, value=float(auto_amount) if auto_amount else 0.0,
             step=0.01, format="%.2f",
         )
 
-        if st.button("Run lookup", type="primary"):
-            workbook_file.seek(0)
-            with st.spinner(f"Scanning {len(sheet_names)} sheets..."):
-                result_df, unmatched, block_info, error = run_invoice_lookup(
-                    workbook_file, recap_sheet,
+        if st.button("Scan for highlighted blocks", type="primary"):
+            with st.spinner("Scanning recap sheet..."):
+                block_info, error = scan_highlighted_blocks(
+                    workbook_bytes, recap_sheet,
                     settings.get("invoice_column_name", "Invoice Number"),
+                    settings.get("amount_column_name", "Comm. Due"),
                     settings.get("highlight_hex", "FFFF00"),
-                    settings.get("target_headers", DEFAULT_INVOICE_LOOKUP_HEADERS),
-                    amount_column_name=settings.get("amount_column_name", "Comm. Due"),
+                    settings.get("block_gap_rows", 3),
                     target_amount=target_amount if target_amount > 0 else None,
-                    block_gap_rows=settings.get("block_gap_rows", 3),
                 )
             if error:
                 st.error(error)
-                if block_info and block_info["blocks"]:
-                    with st.expander("Highlighted blocks found in this sheet"):
-                        for s in block_info["blocks"]:
-                            st.write(f"Rows {s['row_start']}–{s['row_end']} ({s['count']} rows): ${s['total']:,.2f}")
+            elif not block_info["blocks"]:
+                st.warning("No highlighted rows found in this sheet.")
             else:
-                st.session_state.invoice_lookup_result = (result_df, unmatched, block_info)
+                st.session_state.invoice_lookup_blocks = {
+                    "block_info": block_info, "recap_sheet": recap_sheet,
+                }
+                st.session_state.invoice_lookup_result = None
+
+    if st.session_state.invoice_lookup_blocks is not None:
+        block_info = st.session_state.invoice_lookup_blocks["block_info"]
+        recap_sheet = st.session_state.invoice_lookup_blocks["recap_sheet"]
+        blocks = block_info["blocks"]
+
+        st.divider()
+        st.subheader(f"Highlighted blocks found ({len(blocks)})")
+        st.caption("Click the block that matches your commission amount, then fetch its details.")
+
+        labels = [
+            f"Rows {s['row_start']}–{s['row_end']} ({s['count']} rows): ${s['total']:,.2f}"
+            + ("  ✅ matches the amount you entered" if s.get("is_auto_match") else "")
+            for s in blocks
+        ]
+        default_idx = next((i for i, s in enumerate(blocks) if s.get("is_auto_match")), 0)
+        chosen_idx = st.radio(
+            "Blocks", labels, index=default_idx, key="block_choice_radio", label_visibility="collapsed",
+        )
+        chosen_block = blocks[labels.index(chosen_idx)]
+
+        if st.button("Fetch details for this block", type="primary"):
+            with st.spinner("Looking up invoice details..."):
+                result_df, unmatched = fetch_block_details(
+                    st.session_state.invoice_lookup_workbook_bytes, recap_sheet,
+                    settings.get("invoice_column_name", "Invoice Number"),
+                    settings.get("target_headers", DEFAULT_INVOICE_LOOKUP_HEADERS),
+                    chosen_block,
+                )
+            st.session_state.invoice_lookup_result = (result_df, unmatched, chosen_block)
 
     if st.session_state.invoice_lookup_result is not None:
-        result_df, unmatched, block_info = st.session_state.invoice_lookup_result
+        result_df, unmatched, chosen_block = st.session_state.invoice_lookup_result
         st.divider()
         st.subheader("Result")
-        if block_info and block_info.get("matched_block"):
-            mb = block_info["matched_block"]
-            st.success(
-                f"Matched block: rows {mb['row_start']}–{mb['row_end']} "
-                f"({mb['count']} invoices, ${mb['total']:,.2f}) — "
-                f"{len(block_info['blocks'])} total highlighted block(s) found, "
-                f"others were ignored."
-            )
+        st.success(
+            f"Using block: rows {chosen_block['row_start']}–{chosen_block['row_end']} "
+            f"({chosen_block['count']} invoices, ${chosen_block['total']:,.2f})"
+        )
         st.caption(
             f"{len(result_df)} detail row(s) found"
             + (f" · {len(unmatched)} highlighted invoice(s) not found anywhere: {unmatched}" if unmatched else " · all highlighted invoices matched")
