@@ -19,6 +19,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 
+import openpyxl
 import pandas as pd
 import pdfplumber
 import streamlit as st
@@ -27,6 +28,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STD_HEADERS_FILE = os.path.join(APP_DIR, "standard_headers.json")
 MAPPINGS_FILE = os.path.join(APP_DIR, "mappings.json")
 SHEET_PROFILES_FILE = os.path.join(APP_DIR, "sheet_profiles.json")
+INVOICE_LOOKUP_SETTINGS_FILE = os.path.join(APP_DIR, "invoice_lookup_settings.json")
 IGNORE_LABEL = "— ignore this column —"
 
 DEFAULT_STD_HEADERS = [
@@ -553,6 +555,127 @@ def is_zero_or_blank(value):
 
 
 # --------------------------------------------------------------------------
+# Invoice Lookup tool: find highlighted rows in a "recap" sheet, then
+# cross-reference each invoice number against every other sheet in the same
+# workbook, pulling the requested detail fields into one output table.
+# --------------------------------------------------------------------------
+DEFAULT_INVOICE_LOOKUP_HEADERS = [
+    "Company Name", "Invoice Number", "Invoice Date", "Invoice Amount", "%",
+    "Comm. Earned", "SO#", "P/N", "Rev", "Description", "Qty", "Price", "PO#",
+]
+DEFAULT_INVOICE_LOOKUP_SETTINGS = {
+    "recap_sheet_pattern": "recap",
+    "invoice_column_name": "Invoice Number",
+    "highlight_hex": "FFFF00",
+    "target_headers": DEFAULT_INVOICE_LOOKUP_HEADERS,
+}
+
+
+def guess_recap_sheet(sheet_names, pattern):
+    pattern = pattern.lower().strip()
+    matches = [s for s in sheet_names if pattern in s.lower()]
+    return matches[0] if matches else sheet_names[-1]
+
+
+def find_header_row_in_ws(ws, column_name, max_scan=10):
+    for i in range(1, min(max_scan, ws.max_row) + 1):
+        vals = [c.value for c in ws[i]]
+        if any(v == column_name for v in vals):
+            return i, vals
+    return None, None
+
+
+def norm_invoice_key(v):
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def get_highlighted_values(ws, header_row, invoice_col_idx, highlight_hex):
+    """Return, in sheet order, the raw cell value of every row in the invoice
+    column whose fill color matches highlight_hex (case-insensitive, matches
+    on the trailing 6 hex digits so ARGB vs RGB doesn't matter)."""
+    target = highlight_hex.strip().upper().lstrip("#")
+    target = target[-6:] if len(target) >= 6 else target
+    out = []
+    for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row):
+        if invoice_col_idx >= len(row):
+            continue
+        cell = row[invoice_col_idx]
+        fill = cell.fill
+        if not fill or not fill.fgColor or not fill.fgColor.rgb:
+            continue
+        rgb = str(fill.fgColor.rgb)
+        if rgb[-6:] == target:
+            out.append(cell.value)
+    return out
+
+
+def build_invoice_detail_lookup(wb, skip_sheet_name, target_headers, invoice_column_name):
+    lookup = {}
+    for sheet_name in wb.sheetnames:
+        if sheet_name == skip_sheet_name:
+            continue
+        ws = wb[sheet_name]
+        header_row, header_vals = find_header_row_in_ws(ws, invoice_column_name)
+        if header_row is None:
+            continue
+        col_idx = {h: i for i, h in enumerate(header_vals) if h}
+        if invoice_column_name not in col_idx:
+            continue
+        for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row):
+            vals = [c.value for c in row]
+            inv_idx = col_idx[invoice_column_name]
+            if inv_idx >= len(vals):
+                continue
+            key = norm_invoice_key(vals[inv_idx])
+            if key is None:
+                continue
+            record = {}
+            for h in target_headers:
+                idx = col_idx.get(h)
+                v = vals[idx] if idx is not None and idx < len(vals) else None
+                record[h] = v.strip() if isinstance(v, str) else v
+            record["_source_sheet"] = sheet_name
+            lookup.setdefault(key, []).append(record)
+    return lookup
+
+
+def run_invoice_lookup(uploaded_file, recap_sheet_name, invoice_column_name, highlight_hex, target_headers):
+    wb = openpyxl.load_workbook(uploaded_file, data_only=True)
+    ws = wb[recap_sheet_name]
+    header_row, header_vals = find_header_row_in_ws(ws, invoice_column_name)
+    if header_row is None:
+        return None, [], f"Couldn't find a column named '{invoice_column_name}' in {recap_sheet_name}."
+    col_idx = {h: i for i, h in enumerate(header_vals) if h}
+    invoice_col_idx = col_idx[invoice_column_name]
+
+    highlighted_values = get_highlighted_values(ws, header_row, invoice_col_idx, highlight_hex)
+    lookup = build_invoice_detail_lookup(wb, recap_sheet_name, target_headers, invoice_column_name)
+
+    matched_rows = []
+    unmatched = []
+    for inv in highlighted_values:
+        key = norm_invoice_key(inv)
+        if key in lookup:
+            matched_rows.extend(lookup[key])
+        else:
+            unmatched.append(inv)
+
+    if not matched_rows:
+        result_df = pd.DataFrame(columns=target_headers + ["_source_sheet"])
+    else:
+        result_df = pd.DataFrame(matched_rows, columns=target_headers + ["_source_sheet"])
+        for h in target_headers:
+            if "date" in h.lower():
+                result_df[h] = result_df[h].apply(clean_date_value)
+    return result_df, unmatched, None
+
+
+# --------------------------------------------------------------------------
 # app state
 # --------------------------------------------------------------------------
 st.set_page_config(page_title="POS Header Mapper", page_icon="🗂️", layout="wide")
@@ -571,11 +694,28 @@ if "sheet_profiles" not in st.session_state:
 if "output_df" not in st.session_state:
     st.session_state.output_df = None
 
+if "invoice_lookup_settings" not in st.session_state:
+    st.session_state.invoice_lookup_settings = load_json(
+        INVOICE_LOOKUP_SETTINGS_FILE, DEFAULT_INVOICE_LOOKUP_SETTINGS
+    )
+    if not os.path.exists(INVOICE_LOOKUP_SETTINGS_FILE):
+        save_json(INVOICE_LOOKUP_SETTINGS_FILE, st.session_state.invoice_lookup_settings)
+
+if "invoice_lookup_result" not in st.session_state:
+    st.session_state.invoice_lookup_result = None
+
 
 # --------------------------------------------------------------------------
 # sidebar
 # --------------------------------------------------------------------------
 with st.sidebar:
+    st.session_state.tool_mode = st.radio(
+        "Tool", ["Header Mapper", "Highlighted Invoice Lookup"],
+        key="tool_mode_radio",
+        index=0 if st.session_state.get("tool_mode", "Header Mapper") == "Header Mapper" else 1,
+    )
+    st.divider()
+
     with st.expander("💾 Storage status", expanded=False):
         st.caption(f"App folder: `{APP_DIR}`")
         writable = os.access(APP_DIR, os.W_OK)
@@ -597,62 +737,63 @@ with st.sidebar:
             "environment — see above."
         )
 
-    with st.expander(f"⚙️ Remembered sheet setups ({len(st.session_state.sheet_profiles)})", expanded=False):
-        for norm_name, prof in sorted(st.session_state.sheet_profiles.items()):
-            c1, c2 = st.columns([5, 1])
-            status = "included" if prof.get("include") else "skipped"
-            detail = ""
-            if prof.get("include"):
-                if prof.get("kind") == "pdf":
-                    detail = (
-                        f", PDF · drop highlighted: {prof.get('drop_highlighted', True)}"
-                        + (f" · skip if `{prof.get('zero_skip_column')}` is 0" if prof.get("zero_skip_column") else "")
-                    )
-                else:
-                    detail = f", header row {prof.get('header_row')}, anchor `{prof.get('anchor_column')}` ({prof.get('anchor_type')})"
-            c1.markdown(f"`{norm_name}` — **{status}**{detail}")
-            if c2.button("✕", key=f"delprof_{norm_name}", help="Forget this sheet setup"):
-                del st.session_state.sheet_profiles[norm_name]
-                save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
-                st.rerun()
-        if not st.session_state.sheet_profiles:
-            st.caption("Nothing remembered yet.")
-
-    with st.expander(f"⚙️ Remembered column mappings ({len(st.session_state.mappings)})", expanded=False):
-        if st.session_state.mappings:
-            for norm_src in sorted(st.session_state.mappings.keys()):
-                target = st.session_state.mappings[norm_src]
+    if st.session_state.tool_mode == "Header Mapper":
+        with st.expander(f"⚙️ Remembered sheet setups ({len(st.session_state.sheet_profiles)})", expanded=False):
+            for norm_name, prof in sorted(st.session_state.sheet_profiles.items()):
                 c1, c2 = st.columns([5, 1])
-                c1.markdown(f"`{norm_src}` → **{target or '_(ignored)_'}**")
-                if c2.button("✕", key=f"delmap_{norm_src}", help="Forget this mapping"):
-                    del st.session_state.mappings[norm_src]
-                    save_json(MAPPINGS_FILE, st.session_state.mappings)
+                status = "included" if prof.get("include") else "skipped"
+                detail = ""
+                if prof.get("include"):
+                    if prof.get("kind") == "pdf":
+                        detail = (
+                            f", PDF · drop highlighted: {prof.get('drop_highlighted', True)}"
+                            + (f" · skip if `{prof.get('zero_skip_column')}` is 0" if prof.get("zero_skip_column") else "")
+                        )
+                    else:
+                        detail = f", header row {prof.get('header_row')}, anchor `{prof.get('anchor_column')}` ({prof.get('anchor_type')})"
+                c1.markdown(f"`{norm_name}` — **{status}**{detail}")
+                if c2.button("✕", key=f"delprof_{norm_name}", help="Forget this sheet setup"):
+                    del st.session_state.sheet_profiles[norm_name]
+                    save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
                     st.rerun()
-        else:
-            st.caption("Nothing remembered yet.")
-        if st.button("Clear all remembered mappings & sheet setups"):
-            st.session_state.mappings = {}
-            st.session_state.sheet_profiles = {}
-            save_json(MAPPINGS_FILE, {})
-            save_json(SHEET_PROFILES_FILE, {})
-            st.rerun()
+            if not st.session_state.sheet_profiles:
+                st.caption("Nothing remembered yet.")
 
-    st.divider()
-    st.header("Standard columns")
-    st.caption("Your target schema. One column name per line.")
-    std_text = st.text_area(
-        "Standard columns", value="\n".join(st.session_state.std_headers),
-        height=200, label_visibility="collapsed",
-    )
-    if st.button("Save standard columns"):
-        new_list = [line.strip() for line in std_text.split("\n") if line.strip()]
-        if new_list:
-            st.session_state.std_headers = new_list
-            save_json(STD_HEADERS_FILE, new_list)
-            st.success("Saved.")
-            st.rerun()
-        else:
-            st.error("Enter at least one column name.")
+        with st.expander(f"⚙️ Remembered column mappings ({len(st.session_state.mappings)})", expanded=False):
+            if st.session_state.mappings:
+                for norm_src in sorted(st.session_state.mappings.keys()):
+                    target = st.session_state.mappings[norm_src]
+                    c1, c2 = st.columns([5, 1])
+                    c1.markdown(f"`{norm_src}` → **{target or '_(ignored)_'}**")
+                    if c2.button("✕", key=f"delmap_{norm_src}", help="Forget this mapping"):
+                        del st.session_state.mappings[norm_src]
+                        save_json(MAPPINGS_FILE, st.session_state.mappings)
+                        st.rerun()
+            else:
+                st.caption("Nothing remembered yet.")
+            if st.button("Clear all remembered mappings & sheet setups"):
+                st.session_state.mappings = {}
+                st.session_state.sheet_profiles = {}
+                save_json(MAPPINGS_FILE, {})
+                save_json(SHEET_PROFILES_FILE, {})
+                st.rerun()
+
+        st.divider()
+        st.header("Standard columns")
+        st.caption("Your target schema. One column name per line.")
+        std_text = st.text_area(
+            "Standard columns", value="\n".join(st.session_state.std_headers),
+            height=200, label_visibility="collapsed",
+        )
+        if st.button("Save standard columns"):
+            new_list = [line.strip() for line in std_text.split("\n") if line.strip()]
+            if new_list:
+                st.session_state.std_headers = new_list
+                save_json(STD_HEADERS_FILE, new_list)
+                st.success("Saved.")
+                st.rerun()
+            else:
+                st.error("Enter at least one column name.")
 
     st.divider()
     st.header("💾 Backup / restore data")
@@ -666,6 +807,7 @@ with st.sidebar:
         "mappings": st.session_state.mappings,
         "sheet_profiles": st.session_state.sheet_profiles,
         "standard_headers": st.session_state.std_headers,
+        "invoice_lookup_settings": st.session_state.invoice_lookup_settings,
     }, indent=2, ensure_ascii=False)
     st.download_button(
         "⬇ Download backup",
@@ -688,9 +830,13 @@ with st.sidebar:
                 st.session_state.mappings = backup_data.get("mappings", {})
                 st.session_state.sheet_profiles = backup_data.get("sheet_profiles", {})
                 st.session_state.std_headers = backup_data.get("standard_headers", DEFAULT_STD_HEADERS)
+                st.session_state.invoice_lookup_settings = backup_data.get(
+                    "invoice_lookup_settings", DEFAULT_INVOICE_LOOKUP_SETTINGS
+                )
                 save_json(MAPPINGS_FILE, st.session_state.mappings)
                 save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
                 save_json(STD_HEADERS_FILE, st.session_state.std_headers)
+                save_json(INVOICE_LOOKUP_SETTINGS_FILE, st.session_state.invoice_lookup_settings)
                 st.success("Restored.")
                 st.rerun()
         except (json.JSONDecodeError, AttributeError):
@@ -700,306 +846,399 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
-st.title("🗂️ POS Header Mapper")
-st.caption(
-    "Upload one or many POS files, even ones where your data is spread across "
-    "several sheets. Set up each sheet type and column mapping once — every "
-    "future file with the same shape is merged automatically into one output."
-)
-
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
-
-uc1, uc2 = st.columns([5, 1])
-with uc1:
-    uploaded_files = st.file_uploader(
-        "Upload POS file(s)", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True,
-        key=f"uploader_{st.session_state.uploader_key}",
+if st.session_state.tool_mode == "Header Mapper":
+    st.title("🗂️ POS Header Mapper")
+    st.caption(
+        "Upload one or many POS files, even ones where your data is spread across "
+        "several sheets. Set up each sheet type and column mapping once — every "
+        "future file with the same shape is merged automatically into one output."
     )
-with uc2:
-    st.write("")  # vertical spacer to align button with the uploader
-    st.write("")
-    if st.button("🗑 Clear files"):
-        st.session_state.uploader_key += 1
-        st.session_state.output_df = None
-        st.rerun()
 
-if uploaded_files:
-    # 1) Read every sheet of every file
-    file_sheets = {}  # filename -> {sheet_name: raw_df}
-    all_sheet_names = set()
-    for f in uploaded_files:
-        sheets = read_sheets(f)
-        file_sheets[f.name] = sheets
-        all_sheet_names.update(sheets.keys())
+    if "uploader_key" not in st.session_state:
+        st.session_state.uploader_key = 0
 
-    # 2) Find sheet names with no saved profile yet
-    unresolved = sorted({name for name in all_sheet_names if normalize(name) not in st.session_state.sheet_profiles})
-
-    if unresolved:
-        st.subheader("Step 1 — Set up new sheet type(s)")
-        st.caption(
-            "These sheet names haven't been configured yet. For each: choose whether "
-            "it holds row-level data you want, its header row, and an anchor column "
-            "(a column that's always filled on a real data row — used to automatically "
-            "drop subtotal, pivot-table, and blank rows)."
+    uc1, uc2 = st.columns([5, 1])
+    with uc1:
+        uploaded_files = st.file_uploader(
+            "Upload POS file(s)", type=["csv", "xlsx", "xls", "pdf"], accept_multiple_files=True,
+            key=f"uploader_{st.session_state.uploader_key}",
         )
-        widget_state = {}
-        for sheet_name in unresolved:
-            norm_name = normalize(sheet_name)
-            # find one representative entry for this sheet name (from first file that has it)
-            entry = next(
-                sheets[sheet_name] for sheets in file_sheets.values() if sheet_name in sheets
-            )
-            kind = entry.get("kind", "excel")
-            with st.expander(f"Sheet: {sheet_name} ({'PDF' if kind == 'pdf' else 'spreadsheet'})", expanded=True):
-                include = st.checkbox(
-                    "Include this sheet's rows in the merge",
-                    value=not any(k in normalize(sheet_name) for k in ["summary", "pivot", "index", "readme"]),
-                    key=f"inc_{norm_name}",
-                )
-                if include and kind == "pdf":
-                    headers = entry["headers"]
-                    supports_highlight = entry.get("supports_highlight", True)
-                    if supports_highlight:
-                        st.checkbox(
-                            "Drop highlighted/colored rows (e.g. tariff or adjustment lines)",
-                            value=True, key=f"drophl_{norm_name}",
-                        )
-                    zero_options = ["— none —"] + headers
-                    default_zero_candidates = [h for h in ("PaymentDue", "Earned") if h in headers]
-                    default_zero = default_zero_candidates[0] if default_zero_candidates else zero_options[0]
-                    st.selectbox(
-                        "Skip rows where this column is zero or blank (optional)",
-                        zero_options, index=zero_options.index(default_zero),
-                        key=f"zeroskip_{norm_name}",
-                    )
-                    st.caption(f"Columns extracted from this PDF: {', '.join(headers)}")
-                elif include:
-                    sample_df = entry["raw_df"]
-                    is_subtable = entry.get("is_subtable", False)
-                    if is_subtable:
-                        header_row = entry["forced_header_row"]
-                        data_end_row = entry.get("data_end_row")
-                        st.caption(
-                            f"Detected as a labeled section within its sheet — header row {header_row}, "
-                            f"auto-bounded so it won't swallow neighboring sections. This is re-detected "
-                            f"fresh from each file, so it adapts if the row count changes."
-                        )
-                    else:
-                        default_hr = detect_header_row(sample_df)
-                        header_row = st.number_input(
-                            "Header row (1-indexed)", min_value=1,
-                            max_value=max(1, len(sample_df)), value=min(default_hr, max(1, len(sample_df))),
-                            key=f"hr_{norm_name}",
-                        )
-                        data_end_row = None
-                    headers, keep_idx = get_headers_and_col_indices(sample_df, header_row)
-                    if headers:
-                        guess_col, guess_type = guess_anchor(sample_df, header_row, headers, keep_idx)
-                        anchor_col = st.selectbox(
-                            "Anchor column (must be filled on every real data row)",
-                            headers, index=headers.index(guess_col) if guess_col in headers else 0,
-                            key=f"anchor_{norm_name}",
-                        )
-                        anchor_type = st.selectbox(
-                            "Anchor column type", ANCHOR_TYPES,
-                            index=ANCHOR_TYPES.index(guess_type) if guess_type in ANCHOR_TYPES else 0,
-                            key=f"anchortype_{norm_name}",
-                        )
-                        st.caption(f"Detected columns: {', '.join(headers)}")
-                    else:
-                        st.warning("No columns detected on that header row.")
-                widget_state[norm_name] = (sheet_name, kind, entry.get("is_subtable", False))
-
-        if st.button("Save sheet setup", type="primary"):
-            for norm_name, (sheet_name, kind, is_subtable) in widget_state.items():
-                include = st.session_state.get(f"inc_{norm_name}", False)
-                if not include:
-                    st.session_state.sheet_profiles[norm_name] = {
-                        "display_name": sheet_name, "include": False, "kind": kind,
-                    }
-                elif kind == "pdf":
-                    zero_choice = st.session_state.get(f"zeroskip_{norm_name}", "— none —")
-                    st.session_state.sheet_profiles[norm_name] = {
-                        "display_name": sheet_name,
-                        "include": True,
-                        "kind": "pdf",
-                        "drop_highlighted": st.session_state.get(f"drophl_{norm_name}", True),
-                        "zero_skip_column": "" if zero_choice == "— none —" else zero_choice,
-                    }
-                else:
-                    st.session_state.sheet_profiles[norm_name] = {
-                        "display_name": sheet_name,
-                        "include": True,
-                        "kind": "excel",
-                        "is_subtable": is_subtable,
-                        "header_row": st.session_state.get(f"hr_{norm_name}", 1),
-                        "anchor_column": st.session_state.get(f"anchor_{norm_name}"),
-                        "anchor_type": st.session_state.get(f"anchortype_{norm_name}", "text"),
-                    }
-            save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
+    with uc2:
+        st.write("")  # vertical spacer to align button with the uploader
+        st.write("")
+        if st.button("🗑 Clear files"):
+            st.session_state.uploader_key += 1
+            st.session_state.output_df = None
             st.rerun()
 
-    else:
-        # 3) All sheets resolved — extract rows from every included sheet of every file
-        extracted = []  # list of (filename, sheet_name, headers, df_rows)
-        for fname, sheets in file_sheets.items():
-            for sheet_name, entry in sheets.items():
-                prof = st.session_state.sheet_profiles.get(normalize(sheet_name))
-                if not prof or not prof.get("include"):
-                    continue
-                kind = prof.get("kind", entry.get("kind", "excel"))
+    if uploaded_files:
+        # 1) Read every sheet of every file
+        file_sheets = {}  # filename -> {sheet_name: raw_df}
+        all_sheet_names = set()
+        for f in uploaded_files:
+            sheets = read_sheets(f)
+            file_sheets[f.name] = sheets
+            all_sheet_names.update(sheets.keys())
 
-                if kind == "pdf":
-                    headers = entry["headers"]
-                    rows_df = entry["rows_df"].copy()
-                    if prof.get("drop_highlighted", True) and "_highlighted" in rows_df.columns:
-                        rows_df = rows_df[~rows_df["_highlighted"].astype(bool)]
-                    zero_col = prof.get("zero_skip_column")
-                    if zero_col and zero_col in rows_df.columns:
-                        rows_df = rows_df[~rows_df[zero_col].apply(is_zero_or_blank)]
-                    rows_df = rows_df.drop(columns=["_highlighted"], errors="ignore").reset_index(drop=True)
-                    extracted.append((fname, sheet_name, headers, rows_df))
-                else:
-                    raw_df = entry["raw_df"]
-                    if prof.get("is_subtable") and entry.get("is_subtable"):
-                        header_row = entry["forced_header_row"]
-                        data_end_row = entry.get("data_end_row")
-                    else:
-                        header_row = prof["header_row"]
-                        data_end_row = None
-                    headers, keep_idx = get_headers_and_col_indices(raw_df, header_row)
-                    if not headers:
-                        continue
-                    anchor_col = prof.get("anchor_column") or headers[0]
-                    anchor_type = prof.get("anchor_type", "text")
-                    if anchor_col not in headers:
-                        anchor_col = headers[0]
-                    rows_df = extract_valid_rows(
-                        raw_df, header_row, headers, keep_idx, anchor_col, anchor_type, data_end_row
-                    )
-                    extracted.append((fname, sheet_name, headers, rows_df))
+        # 2) Find sheet names with no saved profile yet
+        unresolved = sorted({name for name in all_sheet_names if normalize(name) not in st.session_state.sheet_profiles})
 
-        total_rows = sum(len(r[3]) for r in extracted)
-        st.subheader("Step 2 — Review column mapping")
-        st.caption(
-            f"{len(uploaded_files)} file(s), {len(extracted)} included sheet(s), "
-            f"{total_rows} data row(s) detected after filtering out subtotals/blanks."
-        )
-        with st.expander("Row counts per sheet"):
-            for fname, sheet_name, headers, rows_df in extracted:
-                st.write(f"- **{fname}** / *{sheet_name}*: {len(rows_df)} rows")
-
-        # group by sheet name (same-named sheets across files share one mapping section),
-        # preserving the order sheets were first seen
-        sheets_in_order = []
-        seen_sheet_names = set()
-        headers_by_sheet = {}
-        for fname, sheet_name, headers, rows_df in extracted:
-            norm_sheet = normalize(sheet_name)
-            if norm_sheet not in seen_sheet_names:
-                seen_sheet_names.add(norm_sheet)
-                sheets_in_order.append((norm_sheet, sheet_name))
-                headers_by_sheet[norm_sheet] = headers  # every header from the raw file, no dedup
-
-        std_options = [IGNORE_LABEL] + st.session_state.std_headers
-        mapping_choices = {}  # (norm_sheet, src) -> chosen target
-        total_header_count = 0
-        auto_count = 0
-
-        for norm_sheet, sheet_name in sheets_in_order:
-            headers = headers_by_sheet[norm_sheet]
-            st.markdown(f"#### 📄 {sheet_name}")
-            st.caption(f"{len(headers)} column(s) found in this sheet")
-            hc1, hc2, hc3 = st.columns([3, 1, 4])
-            hc1.markdown("**Column in this sheet**")
-            hc3.markdown("**Maps to your standard column**")
-            for src in headers:
-                total_header_count += 1
-                n = normalize(src)
-                saved = st.session_state.mappings.get(n)
-                if saved is not None:
-                    default_val = saved if saved else IGNORE_LABEL
-                    auto_count += 1
-                else:
-                    exact = next((s for s in st.session_state.std_headers if normalize(s) == n), None)
-                    default_val = exact if exact else IGNORE_LABEL
-                    if exact:
-                        auto_count += 1
-                idx = std_options.index(default_val) if default_val in std_options else 0
-                c1, c2, c3 = st.columns([3, 1, 4])
-                dot = "🟢" if idx != 0 else "🟡"
-                c1.markdown(f"{dot} `{src}`")
-                c2.markdown("→")
-                choice = c3.selectbox(
-                    f"map_{norm_sheet}_{src}", std_options, index=idx,
-                    key=f"map_{norm_sheet}_{src}", label_visibility="collapsed",
-                )
-                mapping_choices[(norm_sheet, src)] = choice
-            st.divider()
-
-        if total_header_count:
+        if unresolved:
+            st.subheader("Step 1 — Set up new sheet type(s)")
             st.caption(
-                f"🟢 auto-filled from memory or exact name match · 🟡 needs your input "
-                f"({auto_count}/{total_header_count} pre-filled)"
+                "These sheet names haven't been configured yet. For each: choose whether "
+                "it holds row-level data you want, its header row, and an anchor column "
+                "(a column that's always filled on a real data row — used to automatically "
+                "drop subtotal, pivot-table, and blank rows)."
             )
+            widget_state = {}
+            for sheet_name in unresolved:
+                norm_name = normalize(sheet_name)
+                # find one representative entry for this sheet name (from first file that has it)
+                entry = next(
+                    sheets[sheet_name] for sheets in file_sheets.values() if sheet_name in sheets
+                )
+                kind = entry.get("kind", "excel")
+                with st.expander(f"Sheet: {sheet_name} ({'PDF' if kind == 'pdf' else 'spreadsheet'})", expanded=True):
+                    include = st.checkbox(
+                        "Include this sheet's rows in the merge",
+                        value=not any(k in normalize(sheet_name) for k in ["summary", "pivot", "index", "readme"]),
+                        key=f"inc_{norm_name}",
+                    )
+                    if include and kind == "pdf":
+                        headers = entry["headers"]
+                        supports_highlight = entry.get("supports_highlight", True)
+                        if supports_highlight:
+                            st.checkbox(
+                                "Drop highlighted/colored rows (e.g. tariff or adjustment lines)",
+                                value=True, key=f"drophl_{norm_name}",
+                            )
+                        zero_options = ["— none —"] + headers
+                        default_zero_candidates = [h for h in ("PaymentDue", "Earned") if h in headers]
+                        default_zero = default_zero_candidates[0] if default_zero_candidates else zero_options[0]
+                        st.selectbox(
+                            "Skip rows where this column is zero or blank (optional)",
+                            zero_options, index=zero_options.index(default_zero),
+                            key=f"zeroskip_{norm_name}",
+                        )
+                        st.caption(f"Columns extracted from this PDF: {', '.join(headers)}")
+                    elif include:
+                        sample_df = entry["raw_df"]
+                        is_subtable = entry.get("is_subtable", False)
+                        if is_subtable:
+                            header_row = entry["forced_header_row"]
+                            data_end_row = entry.get("data_end_row")
+                            st.caption(
+                                f"Detected as a labeled section within its sheet — header row {header_row}, "
+                                f"auto-bounded so it won't swallow neighboring sections. This is re-detected "
+                                f"fresh from each file, so it adapts if the row count changes."
+                            )
+                        else:
+                            default_hr = detect_header_row(sample_df)
+                            header_row = st.number_input(
+                                "Header row (1-indexed)", min_value=1,
+                                max_value=max(1, len(sample_df)), value=min(default_hr, max(1, len(sample_df))),
+                                key=f"hr_{norm_name}",
+                            )
+                            data_end_row = None
+                        headers, keep_idx = get_headers_and_col_indices(sample_df, header_row)
+                        if headers:
+                            guess_col, guess_type = guess_anchor(sample_df, header_row, headers, keep_idx)
+                            anchor_col = st.selectbox(
+                                "Anchor column (must be filled on every real data row)",
+                                headers, index=headers.index(guess_col) if guess_col in headers else 0,
+                                key=f"anchor_{norm_name}",
+                            )
+                            anchor_type = st.selectbox(
+                                "Anchor column type", ANCHOR_TYPES,
+                                index=ANCHOR_TYPES.index(guess_type) if guess_type in ANCHOR_TYPES else 0,
+                                key=f"anchortype_{norm_name}",
+                            )
+                            st.caption(f"Detected columns: {', '.join(headers)}")
+                        else:
+                            st.warning("No columns detected on that header row.")
+                    widget_state[norm_name] = (sheet_name, kind, entry.get("is_subtable", False))
 
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            generate_clicked = st.button("Save mapping & generate merged file", type="primary")
-        with col_b:
-            if st.button("Reset sheet setup (start over)"):
-                st.session_state.sheet_profiles = {}
-                save_json(SHEET_PROFILES_FILE, {})
+            if st.button("Save sheet setup", type="primary"):
+                for norm_name, (sheet_name, kind, is_subtable) in widget_state.items():
+                    include = st.session_state.get(f"inc_{norm_name}", False)
+                    if not include:
+                        st.session_state.sheet_profiles[norm_name] = {
+                            "display_name": sheet_name, "include": False, "kind": kind,
+                        }
+                    elif kind == "pdf":
+                        zero_choice = st.session_state.get(f"zeroskip_{norm_name}", "— none —")
+                        st.session_state.sheet_profiles[norm_name] = {
+                            "display_name": sheet_name,
+                            "include": True,
+                            "kind": "pdf",
+                            "drop_highlighted": st.session_state.get(f"drophl_{norm_name}", True),
+                            "zero_skip_column": "" if zero_choice == "— none —" else zero_choice,
+                        }
+                    else:
+                        st.session_state.sheet_profiles[norm_name] = {
+                            "display_name": sheet_name,
+                            "include": True,
+                            "kind": "excel",
+                            "is_subtable": is_subtable,
+                            "header_row": st.session_state.get(f"hr_{norm_name}", 1),
+                            "anchor_column": st.session_state.get(f"anchor_{norm_name}"),
+                            "anchor_type": st.session_state.get(f"anchortype_{norm_name}", "text"),
+                        }
+                save_json(SHEET_PROFILES_FILE, st.session_state.sheet_profiles)
                 st.rerun()
 
-        if generate_clicked:
-            for (norm_sheet, src), choice in mapping_choices.items():
-                n = normalize(src)
-                st.session_state.mappings[n] = "" if choice == IGNORE_LABEL else choice
-            mappings_saved_ok = save_json(MAPPINGS_FILE, st.session_state.mappings)
+        else:
+            # 3) All sheets resolved — extract rows from every included sheet of every file
+            extracted = []  # list of (filename, sheet_name, headers, df_rows)
+            for fname, sheets in file_sheets.items():
+                for sheet_name, entry in sheets.items():
+                    prof = st.session_state.sheet_profiles.get(normalize(sheet_name))
+                    if not prof or not prof.get("include"):
+                        continue
+                    kind = prof.get("kind", entry.get("kind", "excel"))
 
-            combined_frames = []
+                    if kind == "pdf":
+                        headers = entry["headers"]
+                        rows_df = entry["rows_df"].copy()
+                        if prof.get("drop_highlighted", True) and "_highlighted" in rows_df.columns:
+                            rows_df = rows_df[~rows_df["_highlighted"].astype(bool)]
+                        zero_col = prof.get("zero_skip_column")
+                        if zero_col and zero_col in rows_df.columns:
+                            rows_df = rows_df[~rows_df[zero_col].apply(is_zero_or_blank)]
+                        rows_df = rows_df.drop(columns=["_highlighted"], errors="ignore").reset_index(drop=True)
+                        extracted.append((fname, sheet_name, headers, rows_df))
+                    else:
+                        raw_df = entry["raw_df"]
+                        if prof.get("is_subtable") and entry.get("is_subtable"):
+                            header_row = entry["forced_header_row"]
+                            data_end_row = entry.get("data_end_row")
+                        else:
+                            header_row = prof["header_row"]
+                            data_end_row = None
+                        headers, keep_idx = get_headers_and_col_indices(raw_df, header_row)
+                        if not headers:
+                            continue
+                        anchor_col = prof.get("anchor_column") or headers[0]
+                        anchor_type = prof.get("anchor_type", "text")
+                        if anchor_col not in headers:
+                            anchor_col = headers[0]
+                        rows_df = extract_valid_rows(
+                            raw_df, header_row, headers, keep_idx, anchor_col, anchor_type, data_end_row
+                        )
+                        extracted.append((fname, sheet_name, headers, rows_df))
+
+            total_rows = sum(len(r[3]) for r in extracted)
+            st.subheader("Step 2 — Review column mapping")
+            st.caption(
+                f"{len(uploaded_files)} file(s), {len(extracted)} included sheet(s), "
+                f"{total_rows} data row(s) detected after filtering out subtotals/blanks."
+            )
+            with st.expander("Row counts per sheet"):
+                for fname, sheet_name, headers, rows_df in extracted:
+                    st.write(f"- **{fname}** / *{sheet_name}*: {len(rows_df)} rows")
+
+            # group by sheet name (same-named sheets across files share one mapping section),
+            # preserving the order sheets were first seen
+            sheets_in_order = []
+            seen_sheet_names = set()
+            headers_by_sheet = {}
             for fname, sheet_name, headers, rows_df in extracted:
                 norm_sheet = normalize(sheet_name)
-                out_df = pd.DataFrame(index=range(len(rows_df)), columns=st.session_state.std_headers)
+                if norm_sheet not in seen_sheet_names:
+                    seen_sheet_names.add(norm_sheet)
+                    sheets_in_order.append((norm_sheet, sheet_name))
+                    headers_by_sheet[norm_sheet] = headers  # every header from the raw file, no dedup
+
+            std_options = [IGNORE_LABEL] + st.session_state.std_headers
+            mapping_choices = {}  # (norm_sheet, src) -> chosen target
+            total_header_count = 0
+            auto_count = 0
+
+            for norm_sheet, sheet_name in sheets_in_order:
+                headers = headers_by_sheet[norm_sheet]
+                st.markdown(f"#### 📄 {sheet_name}")
+                st.caption(f"{len(headers)} column(s) found in this sheet")
+                hc1, hc2, hc3 = st.columns([3, 1, 4])
+                hc1.markdown("**Column in this sheet**")
+                hc3.markdown("**Maps to your standard column**")
                 for src in headers:
-                    choice = mapping_choices.get((norm_sheet, src), IGNORE_LABEL)
-                    if choice != IGNORE_LABEL and src in rows_df.columns:
-                        out_df[choice] = rows_df[src].values
-                out_df["_source_file"] = fname
-                out_df["_source_sheet"] = sheet_name
-                combined_frames.append(out_df)
+                    total_header_count += 1
+                    n = normalize(src)
+                    saved = st.session_state.mappings.get(n)
+                    if saved is not None:
+                        default_val = saved if saved else IGNORE_LABEL
+                        auto_count += 1
+                    else:
+                        exact = next((s for s in st.session_state.std_headers if normalize(s) == n), None)
+                        default_val = exact if exact else IGNORE_LABEL
+                        if exact:
+                            auto_count += 1
+                    idx = std_options.index(default_val) if default_val in std_options else 0
+                    c1, c2, c3 = st.columns([3, 1, 4])
+                    dot = "🟢" if idx != 0 else "🟡"
+                    c1.markdown(f"{dot} `{src}`")
+                    c2.markdown("→")
+                    choice = c3.selectbox(
+                        f"map_{norm_sheet}_{src}", std_options, index=idx,
+                        key=f"map_{norm_sheet}_{src}", label_visibility="collapsed",
+                    )
+                    mapping_choices[(norm_sheet, src)] = choice
+                st.divider()
 
-            final_df = pd.concat(combined_frames, ignore_index=True) if combined_frames else pd.DataFrame(
-                columns=st.session_state.std_headers
-            )
-            final_df = format_output_df(final_df, st.session_state.std_headers)
-            final_df = final_df.fillna("")
-            st.session_state.output_df = final_df
-            if mappings_saved_ok:
-                st.success(
-                    f"Merged. {len(final_df)} rows ready to download below. "
-                    f"{len(mapping_choices)} column mapping(s) saved for next time."
+            if total_header_count:
+                st.caption(
+                    f"🟢 auto-filled from memory or exact name match · 🟡 needs your input "
+                    f"({auto_count}/{total_header_count} pre-filled)"
                 )
-            else:
-                st.warning(f"Merged. {len(final_df)} rows ready — but see the storage warning above.")
+
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                generate_clicked = st.button("Save mapping & generate merged file", type="primary")
+            with col_b:
+                if st.button("Reset sheet setup (start over)"):
+                    st.session_state.sheet_profiles = {}
+                    save_json(SHEET_PROFILES_FILE, {})
+                    st.rerun()
+
+            if generate_clicked:
+                for (norm_sheet, src), choice in mapping_choices.items():
+                    n = normalize(src)
+                    st.session_state.mappings[n] = "" if choice == IGNORE_LABEL else choice
+                mappings_saved_ok = save_json(MAPPINGS_FILE, st.session_state.mappings)
+
+                combined_frames = []
+                for fname, sheet_name, headers, rows_df in extracted:
+                    norm_sheet = normalize(sheet_name)
+                    out_df = pd.DataFrame(index=range(len(rows_df)), columns=st.session_state.std_headers)
+                    for src in headers:
+                        choice = mapping_choices.get((norm_sheet, src), IGNORE_LABEL)
+                        if choice != IGNORE_LABEL and src in rows_df.columns:
+                            out_df[choice] = rows_df[src].values
+                    out_df["_source_file"] = fname
+                    out_df["_source_sheet"] = sheet_name
+                    combined_frames.append(out_df)
+
+                final_df = pd.concat(combined_frames, ignore_index=True) if combined_frames else pd.DataFrame(
+                    columns=st.session_state.std_headers
+                )
+                final_df = format_output_df(final_df, st.session_state.std_headers)
+                final_df = final_df.fillna("")
+                st.session_state.output_df = final_df
+                if mappings_saved_ok:
+                    st.success(
+                        f"Merged. {len(final_df)} rows ready to download below. "
+                        f"{len(mapping_choices)} column mapping(s) saved for next time."
+                    )
+                else:
+                    st.warning(f"Merged. {len(final_df)} rows ready — but see the storage warning above.")
 
 
-if st.session_state.output_df is not None:
-    st.divider()
-    st.subheader("Download merged result")
-    df = st.session_state.output_df
-    st.dataframe(df.head(30), use_container_width=True)
+    if st.session_state.output_df is not None:
+        st.divider()
+        st.subheader("Download merged result")
+        df = st.session_state.output_df
+        st.dataframe(df.head(30), use_container_width=True)
 
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇ Download CSV", csv_bytes, file_name="Merged_POS.csv", mime="text/csv")
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇ Download CSV", csv_bytes, file_name="Merged_POS.csv", mime="text/csv")
 
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Merged")
-    st.download_button(
-        "⬇ Download XLSX", buf.getvalue(), file_name="Merged_POS.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Merged")
+        st.download_button(
+            "⬇ Download XLSX", buf.getvalue(), file_name="Merged_POS.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+
+# --------------------------------------------------------------------------
+# main: Highlighted Invoice Lookup tool
+# --------------------------------------------------------------------------
+elif st.session_state.tool_mode == "Highlighted Invoice Lookup":
+    st.title("🔎 Highlighted Invoice Lookup")
+    st.caption(
+        "Upload a workbook with a summary/'recap' sheet where some invoice "
+        "numbers are highlighted, plus many other sheets containing the "
+        "detail line items for those invoices. This finds every highlighted "
+        "invoice and pulls its detail fields from wherever they live in the "
+        "workbook, into one output table."
     )
+
+    settings = st.session_state.invoice_lookup_settings
+
+    with st.expander("⚙️ Settings (remembered — usually no need to touch these)", expanded=False):
+        recap_pattern = st.text_input(
+            "Recap sheet name contains", value=settings.get("recap_sheet_pattern", "recap"),
+        )
+        invoice_col = st.text_input(
+            "Invoice number column name (must match exactly, case-sensitive)",
+            value=settings.get("invoice_column_name", "Invoice Number"),
+        )
+        highlight_hex = st.text_input(
+            "Highlight color (hex, e.g. FFFF00 for yellow)",
+            value=settings.get("highlight_hex", "FFFF00"),
+        )
+        headers_text = st.text_area(
+            "Fields to pull from the detail sheets (one per line, must match "
+            "column names exactly, case-sensitive)",
+            value="\n".join(settings.get("target_headers", DEFAULT_INVOICE_LOOKUP_HEADERS)),
+            height=220,
+        )
+        if st.button("Save settings"):
+            new_headers = [l.strip() for l in headers_text.split("\n") if l.strip()]
+            st.session_state.invoice_lookup_settings = {
+                "recap_sheet_pattern": recap_pattern.strip() or "recap",
+                "invoice_column_name": invoice_col.strip() or "Invoice Number",
+                "highlight_hex": highlight_hex.strip() or "FFFF00",
+                "target_headers": new_headers or DEFAULT_INVOICE_LOOKUP_HEADERS,
+            }
+            save_json(INVOICE_LOOKUP_SETTINGS_FILE, st.session_state.invoice_lookup_settings)
+            st.success("Settings saved.")
+            st.rerun()
+
+    lookup_file = st.file_uploader("Upload workbook", type=["xlsx", "xls"], key="lookup_uploader")
+
+    if lookup_file is not None:
+        wb_preview = openpyxl.load_workbook(lookup_file, read_only=True)
+        sheet_names = wb_preview.sheetnames
+        wb_preview.close()
+        recap_guess = guess_recap_sheet(sheet_names, settings.get("recap_sheet_pattern", "recap"))
+        recap_sheet = st.selectbox(
+            "Which sheet is the recap/summary sheet?",
+            sheet_names, index=sheet_names.index(recap_guess),
+        )
+
+        if st.button("Run lookup", type="primary"):
+            with st.spinner(f"Scanning {len(sheet_names)} sheets..."):
+                result_df, unmatched, error = run_invoice_lookup(
+                    lookup_file, recap_sheet,
+                    settings.get("invoice_column_name", "Invoice Number"),
+                    settings.get("highlight_hex", "FFFF00"),
+                    settings.get("target_headers", DEFAULT_INVOICE_LOOKUP_HEADERS),
+                )
+            if error:
+                st.error(error)
+            else:
+                st.session_state.invoice_lookup_result = (result_df, unmatched)
+
+    if st.session_state.invoice_lookup_result is not None:
+        result_df, unmatched = st.session_state.invoice_lookup_result
+        st.divider()
+        st.subheader("Result")
+        st.caption(
+            f"{len(result_df)} detail row(s) found"
+            + (f" · {len(unmatched)} highlighted invoice(s) not found anywhere: {unmatched}" if unmatched else " · all highlighted invoices matched")
+        )
+        st.dataframe(result_df, use_container_width=True)
+
+        csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇ Download CSV", csv_bytes, file_name="Highlighted_Invoice_Detail.csv", mime="text/csv")
+
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            result_df.to_excel(writer, index=False, sheet_name="Matched Detail")
+        st.download_button(
+            "⬇ Download XLSX", buf.getvalue(), file_name="Highlighted_Invoice_Detail.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
