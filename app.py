@@ -181,17 +181,51 @@ def row_is_valid(value, anchor_type):
     return True  # text: any non-empty value counts
 
 
-def extract_valid_rows(raw_df, header_row, headers, keep_idx, anchor_col, anchor_type):
+def extract_valid_rows(raw_df, header_row, headers, keep_idx, anchor_col, anchor_type, data_end_row=None):
     """Return a DataFrame of only the rows that pass the anchor-column check,
-    i.e. real data rows — not subtotal rows, pivot tables, or blank separators."""
+    i.e. real data rows — not subtotal rows, pivot tables, or blank separators.
+    data_end_row (0-indexed, exclusive), if given, bounds extraction to a
+    single sub-table sharing a sheet with other sub-tables."""
     anchor_local_idx = headers.index(anchor_col) if anchor_col in headers else 0
     anchor_orig_idx = keep_idx[anchor_local_idx]
 
-    body = raw_df.iloc[header_row:, keep_idx].copy()
+    end = data_end_row if data_end_row is not None else len(raw_df)
+    body = raw_df.iloc[header_row:end, keep_idx].copy()
     body.columns = headers
-    anchor_series = raw_df.iloc[header_row:, anchor_orig_idx]
+    anchor_series = raw_df.iloc[header_row:end, anchor_orig_idx]
     mask = anchor_series.apply(lambda v: row_is_valid(v, anchor_type))
     return body[mask.values].reset_index(drop=True)
+
+
+def detect_subtables(raw_df):
+    """Detect multiple labeled mini-tables stacked in one sheet (e.g. an
+    'OEM' section followed by a 'POS' section, each with its own header row).
+    A 'marker' row is one with exactly one non-blank cell, immediately
+    followed (within a few rows) by a header-like row (>=3 non-blank cells).
+    Returns [] if the sheet looks like an ordinary single-table sheet."""
+    n = len(raw_df)
+    markers = []
+    for i in range(n):
+        non_blank = [(j, v) for j, v in enumerate(raw_df.iloc[i]) if not is_blank(v)]
+        if len(non_blank) == 1:
+            for k in range(i + 1, min(i + 4, n)):
+                nxt_non_blank = sum(1 for v in raw_df.iloc[k] if not is_blank(v))
+                if nxt_non_blank == 0:
+                    continue
+                if nxt_non_blank >= 3:
+                    markers.append({"label": str(non_blank[0][1]).strip(), "marker_row": i, "header_row0": k})
+                break
+    if len(markers) < 2:
+        return []  # not a multi-table sheet; let the normal single-table flow handle it
+    subtables = []
+    for idx, m in enumerate(markers):
+        end = markers[idx + 1]["marker_row"] if idx + 1 < len(markers) else n
+        subtables.append({
+            "label": m["label"],
+            "header_row": m["header_row0"] + 1,  # 1-indexed, matches header_row convention elsewhere
+            "data_end_row": end,  # 0-indexed, exclusive — matches iloc slicing convention
+        })
+    return subtables
 
 
 DATE_COLUMN_KEYWORDS = ["date"]
@@ -251,7 +285,16 @@ def read_sheets(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
     out = {}
     for sheet in xls.sheet_names:
-        out[sheet] = {"kind": "excel", "raw_df": xls.parse(sheet, header=None, dtype=str)}
+        raw_df = xls.parse(sheet, header=None, dtype=str)
+        subtables = detect_subtables(raw_df)
+        if subtables:
+            for sub in subtables:
+                out[sub["label"]] = {
+                    "kind": "excel", "raw_df": raw_df, "is_subtable": True,
+                    "forced_header_row": sub["header_row"], "data_end_row": sub["data_end_row"],
+                }
+        else:
+            out[sheet] = {"kind": "excel", "raw_df": raw_df}
     return out
 
 
@@ -734,12 +777,23 @@ if uploaded_files:
                     st.caption(f"Columns extracted from this PDF: {', '.join(headers)}")
                 elif include:
                     sample_df = entry["raw_df"]
-                    default_hr = detect_header_row(sample_df)
-                    header_row = st.number_input(
-                        "Header row (1-indexed)", min_value=1,
-                        max_value=max(1, len(sample_df)), value=min(default_hr, max(1, len(sample_df))),
-                        key=f"hr_{norm_name}",
-                    )
+                    is_subtable = entry.get("is_subtable", False)
+                    if is_subtable:
+                        header_row = entry["forced_header_row"]
+                        data_end_row = entry.get("data_end_row")
+                        st.caption(
+                            f"Detected as a labeled section within its sheet — header row {header_row}, "
+                            f"auto-bounded so it won't swallow neighboring sections. This is re-detected "
+                            f"fresh from each file, so it adapts if the row count changes."
+                        )
+                    else:
+                        default_hr = detect_header_row(sample_df)
+                        header_row = st.number_input(
+                            "Header row (1-indexed)", min_value=1,
+                            max_value=max(1, len(sample_df)), value=min(default_hr, max(1, len(sample_df))),
+                            key=f"hr_{norm_name}",
+                        )
+                        data_end_row = None
                     headers, keep_idx = get_headers_and_col_indices(sample_df, header_row)
                     if headers:
                         guess_col, guess_type = guess_anchor(sample_df, header_row, headers, keep_idx)
@@ -756,10 +810,10 @@ if uploaded_files:
                         st.caption(f"Detected columns: {', '.join(headers)}")
                     else:
                         st.warning("No columns detected on that header row.")
-                widget_state[norm_name] = (sheet_name, kind)
+                widget_state[norm_name] = (sheet_name, kind, entry.get("is_subtable", False))
 
         if st.button("Save sheet setup", type="primary"):
-            for norm_name, (sheet_name, kind) in widget_state.items():
+            for norm_name, (sheet_name, kind, is_subtable) in widget_state.items():
                 include = st.session_state.get(f"inc_{norm_name}", False)
                 if not include:
                     st.session_state.sheet_profiles[norm_name] = {
@@ -779,6 +833,7 @@ if uploaded_files:
                         "display_name": sheet_name,
                         "include": True,
                         "kind": "excel",
+                        "is_subtable": is_subtable,
                         "header_row": st.session_state.get(f"hr_{norm_name}", 1),
                         "anchor_column": st.session_state.get(f"anchor_{norm_name}"),
                         "anchor_type": st.session_state.get(f"anchortype_{norm_name}", "text"),
@@ -808,7 +863,12 @@ if uploaded_files:
                     extracted.append((fname, sheet_name, headers, rows_df))
                 else:
                     raw_df = entry["raw_df"]
-                    header_row = prof["header_row"]
+                    if prof.get("is_subtable") and entry.get("is_subtable"):
+                        header_row = entry["forced_header_row"]
+                        data_end_row = entry.get("data_end_row")
+                    else:
+                        header_row = prof["header_row"]
+                        data_end_row = None
                     headers, keep_idx = get_headers_and_col_indices(raw_df, header_row)
                     if not headers:
                         continue
@@ -816,7 +876,9 @@ if uploaded_files:
                     anchor_type = prof.get("anchor_type", "text")
                     if anchor_col not in headers:
                         anchor_col = headers[0]
-                    rows_df = extract_valid_rows(raw_df, header_row, headers, keep_idx, anchor_col, anchor_type)
+                    rows_df = extract_valid_rows(
+                        raw_df, header_row, headers, keep_idx, anchor_col, anchor_type, data_end_row
+                    )
                     extracted.append((fname, sheet_name, headers, rows_df))
 
         total_rows = sum(len(r[3]) for r in extracted)
